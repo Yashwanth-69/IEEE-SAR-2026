@@ -238,6 +238,19 @@ Per-run console output from both robots is also written to
 - **Marker vs body.** Scoring is measured to the victim's waist marker, which the
   PROTO offsets up to 1.3 m from the mesh origin. The pipeline estimates the
   visible body, so the post-arrival orbit exists to cover that offset.
+- **Reporting is deliberately sparse.** Victim Finding is the mean of three equal
+  terms, one of which grades every `victim_found` report against whether the robot
+  was really inside the 1.0 m ring. The local supervisor applies no penalty for a
+  wrong report, so a wide reporting band looks free in development and is not:
+  only the remote marking server scores that term. Reports are therefore capped
+  per victim and fired from inside the ring, which costs a little found-ratio in
+  exchange for a much larger confidence gain.
+- **The wall map is limited by flyover pose drift**, not by the rendering. The map
+  is already centred on its own wall bounding box and drawn 4 px (0.2 m) thick, to
+  match how the ground-truth map is generated. What is left is genuine drift in the
+  recovered UAV trajectory, which smears wall placement by roughly a metre. The
+  same drift sets the victim estimate error, so the trajectory is the one upstream
+  fix that lifts both halves of Video Information Extraction at once.
 - `FORCE_ODOMETRY = True` rewrites a world's deliverables as it runs, so an
   interrupted forced run leaves that world's estimates incomplete until it is
   re-run to completion.

@@ -456,27 +456,36 @@ CONFIRM_IR_STOP     = 0.25
 # state. The supervisor scores whichever unfound victim is within 1.0 m of our
 # TRUE position when the message lands, so reporting while merely driving PAST a
 # victim still scores it. This is the real fix for "reached <1.0m but MISSED".
-REPORT_RANGE_M      = 1.20
-# Reporting policy. The supervisor scores on our TRUE position, so we MUST fire a
-# victim_found message while physically inside the 1.0 m ring. Two triggers:
-#   A) the camera sees a victim within REPORT_RANGE_M (higher confidence), OR
-#   B) our odometry puts us within REPORT_ODOM_M of an unfound victim's estimate
-#      (the camera may be facing away, or the waist marker sits off the body we
-#      can see). B is what was missing: we drove right onto a victim and never
-#      reported it. Confidence stays honest (mid without a visual), and it is
-#      bounded per victim so it is a handful of messages, not a stream, which keeps
-#      the confidence-accuracy term reasonable without throwing away real finds.
-REPORT_CLOSE_M      = 0.85   # camera range under this earns high confidence
-# Odometry report window. Deliberately WIDER than the 1.0 m scoring radius: our
-# estimate can sit ~1.0-1.7 m from the true waist marker and odometry drifts on
-# top of that, so "odom says exactly 1.0 m from the estimate" frequently never
-# coincides with the moment our TRUE position is inside the marker's ring. By
-# reporting periodically across a 2.0 m band we guarantee a message lands while we
-# are genuinely inside it, which is the only thing the supervisor scores. Bounded
-# per victim so it stays a burst, not an endless stream.
-REPORT_ODOM_M       = 2.00   # odometry within this of an unfound estimate -> report
-REPORT_ODOM_CONF    = 0.60   # confidence for an odometry-only (no visual) report
-REPORT_SEEN_CONF    = 0.80   # ...raised to this when the camera also sees a person
+REPORT_RANGE_M      = 1.00
+# Reporting policy. Victim Finding (40%) is the MEAN of three equally weighted
+# terms: victims-found ratio, time-to-find, and a confidence-accuracy term that
+# compares every victim_found report against whether the robot was genuinely
+# inside the 1.0 m ring when it landed (README line 340; the example report
+# confirms the mean, 1.000/0.607/0.098 -> 0.568).
+#
+# The local supervisor applies NO penalty for a wrong report, which is why a wide,
+# high-rate reporting band looks free here. It is not: only the REMOTE marking
+# server computes the confidence term, and a stream of reports fired from outside
+# the ring drives it to an F. Spraying reports to chase the ratio therefore trades
+# a third of the victim-finding score for part of another third, and loses.
+#
+# So a report is a claim, not a lottery ticket. Two triggers, both meant to be
+# true when they fire:
+#   A) the camera sees a person within REPORT_RANGE_M. Scoring is measured to the
+#      victim's centroid (waist/middle of the body), which is ON the body we can
+#      see, so a close visual is strong evidence we are inside the ring.
+#   B) odometry puts us within REPORT_ODOM_M of an unfound victim's estimate. The
+#      camera may be facing away, so this stays as the fallback that guarantees a
+#      victim driven onto is never silently skipped.
+REPORT_CLOSE_M      = 0.70   # camera range under this earns high confidence
+# Odometry report window. Kept INSIDE the 1.0 m scoring radius on purpose. The
+# flyover estimate itself sits ~0.3-1.7 m from the true marker, and that error is
+# already unavoidable; widening this band on top of it does not add finds, it just
+# adds reports made from positions that were never inside the ring. Reporting from
+# essentially on top of the estimate is the highest-precision moment available.
+REPORT_ODOM_M       = 0.75   # odometry within this of an unfound estimate -> report
+REPORT_ODOM_CONF    = 0.55   # honest: position-only, estimate error unknown to us
+REPORT_SEEN_CONF    = 0.90   # camera corroborates the body is actually here
 # ---- POSITION-ONLY VICTIM MARKING --------------------------------------
 # Checked against the official rules: scoring requires exactly two things, being
 # within 1.0 m of the victim and sending the message (README lines 28, 68, 340).
@@ -492,7 +501,10 @@ MARK_REACH_M        = 0.35   # odometry within this of the estimate = REACHED ->
 # the victim estimate itself (up to ~1.7 m from the true marker). True distance to
 # the victim is therefore roughly estimate_error +/- MARK_REACH_M, and stopping
 # short of the estimate directly costs scoring margin.
-REPORT_MAX_SENDS    = 20     # max victim_found messages per victim across the pass
+REPORT_MAX_SENDS    = 6      # max victim_found messages per victim across the pass.
+# One message scores the victim; every further one can only dilute the confidence
+# term. A short burst covers the case where a single message is lost or arrives a
+# step before the robot is actually inside the ring.
 REPORT_MIN_CONF     = 0.50   # below this, do not send at all
 # Divert-and-close intercept. Drive-by reports at 0.8-1.2 m to the FIGURE can
 # still be >1.0 m from the scoring MARKER (waist, offset up to ~1.3 m on a lying
@@ -706,7 +718,7 @@ if PROFILE == "baseline":
     # window when the robot's TRUE position is inside the scoring radius, which is
     # the only thing the supervisor checks.
     REPORT_ON_ODOM     = True
-    REPORT_MAX_SENDS   = 40      # bounded burst per victim, not an endless stream
+    REPORT_MAX_SENDS   = 6       # short burst per victim; see REPORT_MAX_SENDS above
     ORBIT_S             = 0.0    # no post-confirm orbit
     FGM_ENABLE          = False  # plain DWA heading selection
     # Path hysteresis stays ON. Disabling it lets a flickering costmap cell flip
@@ -2348,9 +2360,13 @@ class GroundMission:
         Lidar is for obstacle avoidance only and never gates a report.
 
         The camera is used ONLY to raise the reported confidence when it happens
-        to see a person (the scheme rewards accurate confidence), and as a
-        secondary trigger for a victim the flyover missed entirely. Runs in ANY
-        state and is bounded per victim so it stays a burst, not a stream."""
+        to see a person, and as a secondary trigger for a victim the flyover
+        missed entirely. Runs in ANY state.
+
+        Every report is also scored for confidence accuracy, so the message count
+        is kept low and each one is fired from the position most likely to be
+        inside the ring. See the REPORT_* block for why a wide band loses points
+        overall."""
         now = self.robot.getTime()
         if self.fallen:
             return          # never claim a find from a position we do not trust
@@ -2358,13 +2374,17 @@ class GroundMission:
             return
         key, rconf, src = None, 0.0, ""
 
-        # PRIMARY: odometry says we are on a victim's estimate. Note this does NOT
-        # skip victims already marked done locally: "done" is our own bookkeeping,
-        # and only the supervisor knows whether a victim actually scored. Since a
-        # victim is marked as soon as the robot is within MARK_REACH_M, skipping
-        # done victims here would stop the reports at the very moment the robot is
-        # closest to the true marker. Repeat reports for a victim that did score are
-        # simply ignored by the supervisor.
+        # PRIMARY: odometry says we are on a victim's estimate. This does NOT skip
+        # victims already marked done locally: "done" is our own bookkeeping, and
+        # only the supervisor knows whether a victim actually scored. A victim is
+        # marked as soon as the robot is within MARK_REACH_M, so skipping done
+        # victims here would stop the reports at the very moment the robot is
+        # closest to the true marker.
+        #
+        # Repeats are NOT free, though. The supervisor's proximity check skips
+        # victims it has already recorded as found, so a repeat report for a victim
+        # that did score comes back with a False verdict and counts against the
+        # confidence term exactly like a miss. That is what REPORT_MAX_SENDS bounds.
         best, best_d = None, (REPORT_ODOM_M if REPORT_ON_ODOM else -1.0)
         for v in self.victims:
             if not self._not_others(v):

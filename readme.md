@@ -7,6 +7,17 @@ Two-part solution for the Phase 1 SAR task:
 2. **Ground fleet control** (`proposed_solution.py`) — the Webots controller that
    drives both ROSbots to those victims, confirms them and reports them.
 
+> **Before simulating a world, run the extraction for that world:**
+>
+> ```bash
+> python src/sar_pipeline.py --file recordings/large_world_flyover.mp4
+> ```
+>
+> Then open that same world in Webots. Step 1 produces the victim and map
+> estimates the controller drives from, so the simulation must not be started
+> until it has been run for the world being opened. Full details in
+> [Running a mission](#2-running-a-mission).
+
 ---
 
 ## 1. Environment
@@ -30,17 +41,31 @@ which the pipeline needs to establish the origin-marker reference frame.
 
 ## 2. Running a mission
 
-### Step 1 — process the flyover footage
+Two steps, **in this order, every time**. Flyover information extraction is a
+separate pre-processing pass: it must be run for a world **before** that world's
+simulation is started.
 
-**This is the one-line pre-processing command, run before each simulation:**
+### Step 1 (required) — extract the flyover information
+
+Run this one-line command for the world you are about to simulate:
 
 ```bash
+python src/sar_pipeline.py --file recordings/<world>_flyover.mp4
+```
+
+For each of the supplied worlds:
+
+```bash
+python src/sar_pipeline.py --file recordings/small_world_flyover.mp4
+python src/sar_pipeline.py --file recordings/medium_world_flyover.mp4
 python src/sar_pipeline.py --file recordings/large_world_flyover.mp4
 ```
 
-The path may be absolute or relative to the competition folder. Everything else
-(the IMU csv, the per-world cache folder, the per-world output folder) is derived
-from that filename, so no source edit is needed to change worlds.
+It writes the two scored deliverables, `sim_logs/victim_location_estimates.csv`
+and `sim_logs/map_estimate.png`, plus `sim_logs/wall_estimates.csv` for the
+controller. The video path may be absolute or relative to the competition folder;
+the IMU csv, cache folder and output folder are all derived from the filename, so
+no source edit is ever needed to change worlds.
 
 | Option | Effect |
 |---|---|
@@ -48,33 +73,28 @@ from that filename, so no source edit is needed to change worlds.
 | `--force` | redo the odometry pass even if a cache exists |
 | `--force-map` | redo the wall-mapping stage even if a cache exists |
 
-With no arguments it defaults to `large_world`.
-
-**This step is also built into the controller as a safety net.** Before the main
-control loop starts, `proposed_solution.py` checks whether the deliverables in
-`sim_logs/` belong to the world Webots actually has open. If they do it goes
-straight to the control loop; if they do not it runs the extraction itself for the
-loaded world. Only robot1 runs it, so two processes never write the same files,
-and robot2 waits for the result.
-
-Running the command beforehand is still recommended: a world that has never been
-processed takes minutes of video work, and the 3 minute mission clock starts when
-the simulation does. Set `AUTO_PREPROCESS = False` in `proposed_solution.py` to
-disable the safety net.
-
-- **First run for a world** performs the full video pass (several minutes) and
-  writes the deliverables plus a reusable cache.
-- **Every later run** for the same world takes about a second: it just copies that
-  world's deliverables into `sim_logs/` and exits.
+The first run for a world performs the full video pass and takes a few minutes.
+Every later run for that world takes about a second, because the results are
+cached per world and simply copied into `sim_logs/`.
 
 ### Step 2 — run the simulation
 
-Open the matching world in Webots (`worlds/large_world.wbt`) and press play.
+Open **the same world** in Webots and press play.
 
-> **The world processed in step 1 must match the `.wbt` you open.** The
-> deliverables in `sim_logs/` belong to one world at a time. If they disagree, the
-> controller prints a `WORLD MISMATCH` banner in the first second of the run
-> instead of silently driving to another world's coordinates.
+> ### The world in step 1 must be the world you open in step 2
+>
+> `sim_logs/` holds the results of one world at a time. Opening a different `.wbt`
+> sends the robots to another world's victim coordinates, and the mission is lost
+> before it starts.
+>
+> This is checked at runtime rather than left to chance: the controller compares
+> the loaded `.wbt` against `sim_logs/ACTIVE_WORLD.txt` and prints a
+> `WORLD MISMATCH` banner in the first second of the run, naming both worlds and
+> the command to fix it. The supervisor separately warns when the number of
+> submitted estimates does not match the number of victims in the world.
+>
+> If you see that banner, stop the simulation, re-run step 1 for the correct
+> world, and start again.
 
 ### Optional — verify the estimates without Webots
 

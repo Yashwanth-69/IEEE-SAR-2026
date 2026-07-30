@@ -23,8 +23,6 @@ its map rotated 90 degrees from that frame, so we rotate it back on load
 
 import os
 import sys
-import time
-import subprocess
 import csv
 import json
 import math
@@ -62,20 +60,6 @@ SIM_LOGS  = os.path.join(HERE, "sim_logs")
 # The first process to start creates the folder and the other joins it (any folder
 # younger than RUN_JOIN_S).
 RUN_LOGS_ROOT = os.path.join(HERE, "run_logs")
-
-# ---------------------------- MISSION PRE-PROCESSING ------------------------
-# Flyover information extraction is normally run as its own one-line command
-# before starting Webots. As a safety net the controller also checks, before the
-# control loop starts, that the deliverables in sim_logs/ belong to the world that
-# is actually loaded, and runs the pipeline itself if they do not. When the world
-# has already been processed this costs nothing: the pipeline just mirrors that
-# world's cached results and exits, so the usual path is a fast no-op.
-# Only robot1 runs it, to avoid two processes writing the same files; robot2 waits
-# for the result. A cold world still takes minutes of video processing, which
-# would consume mission time, so pre-processing ahead of the run remains the
-# recommended workflow.
-AUTO_PREPROCESS   = True
-PREPROCESS_WAIT_S = 600.0   # how long robot2 waits for robot1's pipeline run
 RUN_JOIN_S    = 90.0      # reuse the newest run folder if it is younger than this
 
 
@@ -1009,8 +993,6 @@ class GroundMission:
         start_run_log(self.name)     # tee this robot's console into run_logs/
 
         self._init_devices()
-        if AUTO_PREPROCESS:
-            self.ensure_mission_plan()
 
         x0, y0, th0 = START_POSES.get(self.name, (0.0, 0.0, 0.0))
         self.x, self.y, self.theta = x0, y0, th0
@@ -1195,74 +1177,6 @@ class GroundMission:
         self.squad_receiver.enable(self.timestep)
 
     # ---- data loading -----------------------------------------------------
-    def _loaded_world(self):
-        """Name of the .wbt Webots actually has open, or None."""
-        try:
-            wp = self.robot.getWorldPath()
-            return os.path.splitext(os.path.basename(wp))[0] if wp else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _plan_ready(world):
-        """True when sim_logs/ holds deliverables belonging to `world`."""
-        try:
-            with open(os.path.join(SIM_LOGS, "ACTIVE_WORLD.txt")) as f:
-                if f.read().strip() != world:
-                    return False
-        except OSError:
-            return False
-        return all(os.path.exists(os.path.join(SIM_LOGS, n))
-                   for n in ("victim_location_estimates.csv", "wall_estimates.csv"))
-
-    def ensure_mission_plan(self):
-        """Make sure the flyover deliverables match the world that is loaded,
-        running the extraction pipeline first if they do not.
-
-        Normally a no-op: the deliverables are already in place from the one-line
-        command and this returns immediately. It exists so a simulation started
-        without that step still gets the right mission plan instead of driving to
-        another world's victim coordinates."""
-        world = self._loaded_world()
-        if world is None or self._plan_ready(world):
-            return
-
-        pipeline = os.path.join(HERE, "src", "sar_pipeline.py")
-        video = os.path.join(REPO_ROOT, "recordings", world + "_flyover.mp4")
-        if not (os.path.exists(pipeline) and os.path.exists(video)):
-            print(f"[{self.name}] no flyover footage for '{world}'; "
-                  f"continuing with whatever sim_logs/ holds")
-            return
-
-        if self.index != 0:
-            # Second robot: wait for the first to publish, stepping the simulation
-            # so Webots is not blocked while it waits.
-            print(f"[{self.name}] waiting for the mission plan for '{world}'...")
-            deadline = self.robot.getTime() + PREPROCESS_WAIT_S
-            while self.robot.getTime() < deadline:
-                if self._plan_ready(world):
-                    print(f"[{self.name}] mission plan ready")
-                    return
-                if self.robot.step(self.timestep) == -1:
-                    return
-            print(f"[{self.name}] timed out waiting for the mission plan")
-            return
-
-        print(f"[{self.name}] no mission plan for '{world}'; running flyover "
-              f"extraction (this is the one-line command, run inline)")
-        try:
-            r = subprocess.run([sys.executable, pipeline, "--file", video],
-                               cwd=os.path.dirname(pipeline),
-                               capture_output=True, text=True, timeout=PREPROCESS_WAIT_S)
-            for line in (r.stdout or "").splitlines():
-                if line.startswith("[world]") or line.startswith("[victims]"):
-                    print(f"[{self.name}] {line}")
-            if not self._plan_ready(world):
-                print(f"[{self.name}] extraction did not produce a usable plan "
-                      f"(exit {r.returncode})")
-        except Exception as e:
-            print(f"[{self.name}] flyover extraction failed ({e})")
-
     def _load_victims(self):
         victims = []
         if os.path.exists(VICTIM_CSV):

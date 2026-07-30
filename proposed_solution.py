@@ -527,8 +527,17 @@ REPORT_CLOSE_M      = 0.70   # camera range under this earns high confidence
 # send budget is therefore spent walking inward, and the last sends land at the
 # closest approach the robot could physically make, which is the best shot at
 # being inside the ring that exists.
-REPORT_ODOM_M       = 1.60   # odometry within this of an unfound estimate -> consider
-REPORT_IMPROVE_M    = 0.15   # ...and only if this much nearer than our last report
+#
+# The window must cover the whole achievable approach, not part of it. At 1.60 m it
+# still cut victim4 out entirely: the robot's closest approach to that estimate was
+# 1.71 m, so the odometry path never fired once, even though the robot's TRUE
+# distance to the marker reached 0.84 m and a report there would have scored.
+REPORT_ODOM_M       = 2.20   # odometry within this of an unfound estimate -> consider
+# Improvement step. It also sets how far short of the true closest approach the
+# last report can land: the robot creeps the final stretch in small increments, and
+# any step smaller than this never earns a send. Kept small so the final report is
+# made within a few centimetres of the nearest the robot ever got.
+REPORT_IMPROVE_M    = 0.10   # ...and only if this much nearer than our last report
 REPORT_ODOM_CONF    = 0.55   # honest: position-only, estimate error unknown to us
 REPORT_SEEN_CONF    = 0.90   # camera corroborates the body is actually here
 # ---- POSITION-ONLY VICTIM MARKING --------------------------------------
@@ -546,10 +555,12 @@ MARK_REACH_M        = 0.35   # odometry within this of the estimate = REACHED ->
 # the victim estimate itself (up to ~1.7 m from the true marker). True distance to
 # the victim is therefore roughly estimate_error +/- MARK_REACH_M, and stopping
 # short of the estimate directly costs scoring margin.
-REPORT_MAX_SENDS    = 6      # max victim_found messages per victim across the pass.
-# One message scores the victim; every further one can only dilute the confidence
-# term. A short burst covers the case where a single message is lost or arrives a
-# step before the robot is actually inside the ring.
+REPORT_MAX_SENDS    = 24     # max victim_found messages per victim across the pass.
+# This is a backstop, not the real limiter: the closest-approach gate already caps
+# the count at about REPORT_ODOM_M / REPORT_IMPROVE_M sends, since each one has to
+# beat the last by REPORT_IMPROVE_M. Sized just above that so the budget can never
+# empty before the robot reaches its closest approach, which is exactly how a
+# victim the robot physically reached at 0.84 m was missed.
 REPORT_MIN_CONF     = 0.50   # below this, do not send at all
 # Divert-and-close intercept. Drive-by reports at 0.8-1.2 m to the FIGURE can
 # still be >1.0 m from the scoring MARKER (waist, offset up to ~1.3 m on a lying
@@ -763,7 +774,7 @@ if PROFILE == "baseline":
     # window when the robot's TRUE position is inside the scoring radius, which is
     # the only thing the supervisor checks.
     REPORT_ON_ODOM     = True
-    REPORT_MAX_SENDS   = 6       # short burst per victim; see REPORT_MAX_SENDS above
+    REPORT_MAX_SENDS   = 24      # backstop only; see REPORT_MAX_SENDS above
     ORBIT_S             = 0.0    # no post-confirm orbit
     FGM_ENABLE          = False  # plain DWA heading selection
     # Path hysteresis stays ON. Disabling it lets a flickering costmap cell flip
@@ -2441,6 +2452,7 @@ class GroundMission:
         # victims it has already recorded as found, so a repeat report for a victim
         # that did score comes back with a False verdict and counts against the
         # confidence term exactly like a miss. That is what REPORT_MAX_SENDS bounds.
+        gate_d = float("inf")     # the distance the closest-approach gate judges
         best, best_d = None, (REPORT_ODOM_M if REPORT_ON_ODOM else -1.0)
         for v in self.victims:
             if not self._not_others(v):
@@ -2453,6 +2465,7 @@ class GroundMission:
             key = best.get("id")
             rconf = REPORT_SEEN_CONF if saw else REPORT_ODOM_CONF
             src = "odom+cam" if saw else "odom"
+            gate_d = best_d
 
         # Camera-confirmed report: a person in view whose measured range puts us
         # inside the scoring radius. This is the only reporting path in the
@@ -2470,31 +2483,40 @@ class GroundMission:
                     v = self._victim_at(dwx, dwy)
                     if v is not None:
                         key, rconf, src = v.get("id"), REPORT_SEEN_CONF, "cam"
+                        gate_d = rng
                     elif conf >= NEW_VICTIM_CONF and self._new_victim_ok(dwx, dwy):
-                        key = ("live", round(dwx, 1), round(dwy, 1))
+                        # Snap to a coarse grid: rounding finely gave a slightly
+                        # different key every frame, and each new key came with a
+                        # fresh send budget, so one victim could report without limit.
+                        key = ("live", round(dwx), round(dwy))
                         rconf, src = REPORT_SEEN_CONF, "cam-new"
+                        gate_d = rng
 
         if key is None or rconf < REPORT_MIN_CONF:
             return
         track = self.reported.setdefault(key, {"n": 0, "t": -1e9, "bd": float("inf")})
         if track["n"] >= REPORT_MAX_SENDS:
             return
-        # Closest-approach gate. Spend the send budget walking inward rather than
-        # burning it on the way in: an odometry report only fires when it beats our
-        # nearest previous report on this victim, so the final sends are made from
-        # the closest the robot could physically get. A camera report is exempt,
-        # because seeing the body at close range is direct evidence of being at the
-        # victim and does not depend on the estimate being right.
-        if src.startswith("odom"):
-            if best_d > track["bd"] - REPORT_IMPROVE_M:
-                return
-            track["bd"] = min(track["bd"], best_d)
+        # Closest-approach gate, applied to EVERY path. A report fires only when it
+        # beats our nearest previous report on this victim, so the budget is spent
+        # walking inward and the last send is made from the closest the robot could
+        # physically get.
+        #
+        # Exempting the camera path is what lost a scored victim: the camera fires
+        # in bursts from wherever it first sees the body, so it emptied the budget
+        # metres out, and when the robot later closed to 0.84 m of victim4 - inside
+        # the ring - it had nothing left to send and the victim was missed. The
+        # metric differs per path (distance to the estimate for odometry, measured
+        # range for the camera) but the rule does not.
+        if gate_d > track["bd"] - REPORT_IMPROVE_M:
+            return
+        track["bd"] = min(track["bd"], gate_d)
         self.report_victim(rconf)
         track["n"] += 1
         track["t"] = now
         self.last_report = now
         print(f"[{self.name}] REPORT v#{key} src={src} conf={rconf:.2f} "
-              f"d={best_d:.2f} send {track['n']}/{REPORT_MAX_SENDS} ({self.state})")
+              f"d={gate_d:.2f} send {track['n']}/{REPORT_MAX_SENDS} ({self.state})")
 
     def maybe_intercept(self):
         """Divert-and-close: while navigating or exploring, a person seen up

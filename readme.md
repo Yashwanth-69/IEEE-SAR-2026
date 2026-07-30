@@ -50,6 +50,18 @@ from that filename, so no source edit is needed to change worlds.
 
 With no arguments it defaults to `large_world`.
 
+**This step is also built into the controller as a safety net.** Before the main
+control loop starts, `proposed_solution.py` checks whether the deliverables in
+`sim_logs/` belong to the world Webots actually has open. If they do it goes
+straight to the control loop; if they do not it runs the extraction itself for the
+loaded world. Only robot1 runs it, so two processes never write the same files,
+and robot2 waits for the result.
+
+Running the command beforehand is still recommended: a world that has never been
+processed takes minutes of video work, and the 3 minute mission clock starts when
+the simulation does. Set `AUTO_PREPROCESS = False` in `proposed_solution.py` to
+disable the safety net.
+
 - **First run for a world** performs the full video pass (several minutes) and
   writes the deliverables plus a reusable cache.
 - **Every later run** for the same world takes about a second: it just copies that

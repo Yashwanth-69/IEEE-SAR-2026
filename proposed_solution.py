@@ -297,6 +297,31 @@ OBS_DECAY       = 0.995       # very slow fade, only to bleed off odometry-drift
 OBS_MAX_RANGE   = 2.5         # mark hits closer than this; clear out to here, metres
 OBS_UPDATE_S    = 0.10        # min seconds between obstacle-layer updates
 REPLAN_PERIOD_S = 1.5         # replan on the fused map at least this often
+
+# Disproving the flyover wall map.
+#
+# The flyover map is a PRIOR, not ground truth. Scored against the true world
+# layout it sits about a metre out in places and contains walls that are not there
+# at all: on large_world it draws roughly a third more wall pixels than exist,
+# because every wall is stamped using a UAV pose that drifted. Treated as immutable
+# geometry it walls the robot in behind obstacles its own lidar sees straight
+# through, which is exactly what the run logs show - lidar and depth both reading
+# max range in every direction while the planner insists there is no route, the
+# robot thrashing on the spot until the mission times out.
+#
+# So a static wall cell can be DISPROVEN. Every beam that passes cleanly through
+# such a cell and terminates well beyond it is one vote that the cell is wrong;
+# enough independent votes and it stops blocking the plan. A real wall can never
+# collect them, because it stops the beam that would have to pass through it.
+#
+# Being wrong in this direction is the recoverable one. The reactive collision
+# monitor sits below the planner and is what actually prevents contact, so an
+# optimistic plan gets stopped at the wall; a pessimistic plan strands the robot
+# with no way to discover it was wrong.
+WALL_DOUBT_HIT      = 1.0     # votes added per clean see-through
+WALL_DOUBT_CLEAR    = 12.0    # votes before the cell stops blocking planning
+WALL_DOUBT_MARGIN_M = 0.40    # beam must terminate this far beyond the cell to vote
+WALL_DOUBT_DECAY    = 0.999   # votes bleed off slowly, so evidence must be sustained
 # Path hysteresis. A* is re-run periodically on a costmap that changes as the
 # lidar and depth camera stamp cells, and two routes around an obstacle can have
 # nearly equal cost. Accepting every new plan therefore lets a single flickering
@@ -402,6 +427,14 @@ RECOVER_ROTATE_S   = 2.2
 REPORT_PERIOD_S = 0.5
 YOLO_CONF       = 0.30
 YOLO_PERIOD_S   = 0.4
+# Both ROSbots spawn side by side on the origin-marker pad, so at t=0 each one has
+# the other filling its camera. The other-robot filter cannot help yet: it needs a
+# squad broadcast to know where the other robot is, and none has arrived. Every run
+# therefore opened with a confident victim_found fired from the launch pad, which is
+# a guaranteed wrong report. A brand-new victim is only registered once the other
+# robot can actually be ruled out, and never on the pad itself. This is the same
+# keep-out the flyover pipeline applies for the same reason.
+NEW_VICTIM_START_M = 2.0  # no new-victim registration this close to our start pose
 NEW_VICTIM_CONF = 0.70   # to REGISTER a brand-new (not-from-pipeline) victim during
                          # exploration, the detection must be at least this confident
                          # AND land inside the arena, so a false positive cannot spawn
@@ -478,12 +511,24 @@ REPORT_RANGE_M      = 1.00
 #      camera may be facing away, so this stays as the fallback that guarantees a
 #      victim driven onto is never silently skipped.
 REPORT_CLOSE_M      = 0.70   # camera range under this earns high confidence
-# Odometry report window. Kept INSIDE the 1.0 m scoring radius on purpose. The
-# flyover estimate itself sits ~0.3-1.7 m from the true marker, and that error is
-# already unavoidable; widening this band on top of it does not add finds, it just
-# adds reports made from positions that were never inside the ring. Reporting from
-# essentially on top of the estimate is the highest-precision moment available.
-REPORT_ODOM_M       = 0.75   # odometry within this of an unfound estimate -> report
+# Odometry report window, and why it is not simply "inside 1.0 m".
+#
+# The robot usually CANNOT reach its own estimate. The estimate is the victim's
+# centroid, which sits inside the body, so the anti-stomp floor halts the robot
+# against the body roughly 1.1-1.7 m short of it. Across 18 logged runs the
+# closest odometry approach to a victim estimate was 0.91-1.87 m, and the one
+# victim that actually scored was reported from 1.69 m from its estimate, with the
+# robot's TRUE distance to the marker at 1.00 m.
+#
+# So a window tight enough to look precise would suppress the only reports that
+# ever score. The window stays wide enough to cover the achievable approach, and
+# precision comes from REPORT_IMPROVE_M instead: a report only fires when the
+# robot is meaningfully CLOSER to that victim than at any previous report. The
+# send budget is therefore spent walking inward, and the last sends land at the
+# closest approach the robot could physically make, which is the best shot at
+# being inside the ring that exists.
+REPORT_ODOM_M       = 1.60   # odometry within this of an unfound estimate -> consider
+REPORT_IMPROVE_M    = 0.15   # ...and only if this much nearer than our last report
 REPORT_ODOM_CONF    = 0.55   # honest: position-only, estimate error unknown to us
 REPORT_SEEN_CONF    = 0.90   # camera corroborates the body is actually here
 # ---- POSITION-ONLY VICTIM MARKING --------------------------------------
@@ -808,20 +853,28 @@ class OccupancyGrid:
                   max(0, c - rad):min(self.nx, c + rad + 1)] = 1
         self.occ = grown
 
-    def rebuild(self, dyn_mask):
+    def rebuild(self, dyn_mask, disproven=None):
         """Fuse the live obstacle layer into the plan: union the static walls
         with the sensed obstacles (inflated by the robot radius), then recompute
         the soft cost. A* run after this routes around furniture the offline map
-        never saw."""
+        never saw.
+
+        `disproven` are static cells the lidar has repeatedly seen through. They
+        are dropped from the static layer BEFORE the sensed obstacles are merged
+        in, so a phantom wall stops blocking the plan while anything actually
+        sensed at those cells still does."""
+        static = self.static_occ
+        if disproven is not None and disproven.any():
+            static = np.where(disproven, 0, static).astype(np.uint8)
         rad = int(math.ceil(DYN_INFLATE_M / self.res))
         if dyn_mask is not None and dyn_mask.any():
-            dil = np.zeros_like(self.static_occ)
+            dil = np.zeros_like(static)
             for r, c in zip(*np.nonzero(dyn_mask)):
                 dil[max(0, r - rad):min(self.ny, r + rad + 1),
                     max(0, c - rad):min(self.nx, c + rad + 1)] = 1
-            self.occ = (self.static_occ | dil).astype(np.uint8)
+            self.occ = (static | dil).astype(np.uint8)
         else:
-            self.occ = self.static_occ.copy()
+            self.occ = static.copy()
         self._compute_cost()
 
     def _compute_cost(self):
@@ -1289,6 +1342,9 @@ class GroundMission:
                                   [(v["x"], v["y"]) for v in self.victims],
                                   self.start_xy)
         self.obs_score = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
+        # See-through evidence against the flyover map's static walls.
+        self.wall_doubt = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
+        self.wall_cleared = 0        # how many static cells we have disproven
         self.map_bounds = self._compute_map_bounds()
         self.explore_targets = self._my_explore_targets()
         self.explore_remaining = list(self.explore_targets)
@@ -2414,21 +2470,31 @@ class GroundMission:
                     v = self._victim_at(dwx, dwy)
                     if v is not None:
                         key, rconf, src = v.get("id"), REPORT_SEEN_CONF, "cam"
-                    elif conf >= NEW_VICTIM_CONF:
+                    elif conf >= NEW_VICTIM_CONF and self._new_victim_ok(dwx, dwy):
                         key = ("live", round(dwx, 1), round(dwy, 1))
                         rconf, src = REPORT_SEEN_CONF, "cam-new"
 
         if key is None or rconf < REPORT_MIN_CONF:
             return
-        track = self.reported.setdefault(key, {"n": 0, "t": -1e9})
+        track = self.reported.setdefault(key, {"n": 0, "t": -1e9, "bd": float("inf")})
         if track["n"] >= REPORT_MAX_SENDS:
             return
+        # Closest-approach gate. Spend the send budget walking inward rather than
+        # burning it on the way in: an odometry report only fires when it beats our
+        # nearest previous report on this victim, so the final sends are made from
+        # the closest the robot could physically get. A camera report is exempt,
+        # because seeing the body at close range is direct evidence of being at the
+        # victim and does not depend on the estimate being right.
+        if src.startswith("odom"):
+            if best_d > track["bd"] - REPORT_IMPROVE_M:
+                return
+            track["bd"] = min(track["bd"], best_d)
         self.report_victim(rconf)
         track["n"] += 1
         track["t"] = now
         self.last_report = now
         print(f"[{self.name}] REPORT v#{key} src={src} conf={rconf:.2f} "
-              f"send {track['n']}/{REPORT_MAX_SENDS} ({self.state})")
+              f"d={best_d:.2f} send {track['n']}/{REPORT_MAX_SENDS} ({self.state})")
 
     def maybe_intercept(self):
         """Divert-and-close: while navigating or exploring, a person seen up
@@ -2568,6 +2634,17 @@ class GroundMission:
             return clamp(0.55 + 0.10 * yolo_conf, 0.55, 0.65)
         return 0.0
 
+    def _new_victim_ok(self, wx, wy):
+        """Whether a detection with no matching flyover victim may be registered as
+        a brand-new one. Requires that the other robot can actually be ruled out
+        (its position is known) and that we are not still on the launch pad, where
+        the only person-shaped thing in view is the other ROSbot."""
+        if self.other_pos is None:
+            return False
+        if math.hypot(wx - self.start_xy[0], wy - self.start_xy[1]) < NEW_VICTIM_START_M:
+            return False
+        return True
+
     def _detection_is_theirs(self, bearing, rng):
         """True if a camera detection at this bearing/range is really the other
         robot, or the victim it has already claimed, so we do not lock onto it
@@ -2664,6 +2741,7 @@ class GroundMission:
             return
         self.last_obs_update = now
         self.obs_score *= OBS_DECAY          # tiny fade, only for drift smears
+        self.wall_doubt *= WALL_DOUBT_DECAY  # evidence must be sustained, not stale
         angs, rs = self.read_lidar()
         g = self.grid
         tv = self._target_victim_xy()        # never mark the victim we approach
@@ -2674,10 +2752,19 @@ class GroundMission:
             ey = self.y + clear_d * math.sin(self.theta + a)
             r1, c1 = g.world_to_cell(ex, ey)
             # Clear the free space the beam travelled through (self-corrects marks
-            # that have moved or were noise), but never carve the static walls.
-            for (rr, cc) in self._ray_cells(r0, c0, r1, c1):
-                if g.in_bounds(rr, cc) and not g.static_occ[rr, cc]:
+            # that have moved or were noise). A static wall cell is not cleared
+            # here, but every beam that passed cleanly through it and ended well
+            # beyond votes that the flyover map put a wall where there is none.
+            cells = self._ray_cells(r0, c0, r1, c1)
+            span = max(1, len(cells) - 1)
+            vote_upto = clear_d - WALL_DOUBT_MARGIN_M
+            for i, (rr, cc) in enumerate(cells):
+                if not g.in_bounds(rr, cc):
+                    continue
+                if not g.static_occ[rr, cc]:
                     self.obs_score[rr, cc] = max(0.0, self.obs_score[rr, cc] - OBS_MISS)
+                elif clear_d * i / span <= vote_upto:
+                    self.wall_doubt[rr, cc] += WALL_DOUBT_HIT
             # Mark the hit cell itself (only real, close returns).
             if d >= OBS_MAX_RANGE:
                 continue
@@ -2720,8 +2807,23 @@ class GroundMission:
                 mask[r, c] = False
         return mask
 
+    def _disproven_mask(self):
+        """Static wall cells the lidar has seen through often enough to overrule
+        the flyover map. Returns None until at least one cell qualifies."""
+        if self.wall_doubt is None:
+            return None
+        mask = self.wall_doubt >= WALL_DOUBT_CLEAR
+        n = int(mask.sum())
+        if n == 0:
+            return None
+        if n != self.wall_cleared:
+            print(f"[{self.name}] flyover map: {n} static wall cells disproven by "
+                  f"lidar see-through (was {self.wall_cleared}); replanning through them")
+            self.wall_cleared = n
+        return mask
+
     def _fused_rebuild(self):
-        self.grid.rebuild(self._dyn_mask())
+        self.grid.rebuild(self._dyn_mask(), self._disproven_mask())
 
     def plan_to(self, gx, gy):
         """Replan on the fused map (static walls + sensed obstacles). Returns
@@ -3288,6 +3390,7 @@ class GroundMission:
                         self._enter_confirm()
                         return
                 elif conf >= NEW_VICTIM_CONF and self._in_bounds(vx, vy) \
+                        and self._new_victim_ok(vx, vy) \
                         and self._new_victim_candidate(vx, vy):
                     # Confirmed over several sightings: register it with a fresh id
                     # so it joins the shared claim/done bookkeeping.

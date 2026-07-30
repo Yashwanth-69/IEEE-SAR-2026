@@ -177,7 +177,17 @@ ALIGN_ANGLE  = math.radians(75)
 ALIGN_CREEP  = 0.05        # m/s kept on while pivoting, so it does not fully stall
 
 # Global planner.
-GRID_RES   = 0.10
+# Planning grid resolution. At 0.10 m the large_world grid is ~70,000 cells and it
+# is 91% open, so A* expands an enormous frontier: measured against the real map,
+# planning to victim3 took 2.4 SECONDS. The controller replans every 1.5 s, so
+# Webots sat blocked more often than not - that is the stall, and while the
+# controller is blocked the robot keeps executing its last wheel command, which is
+# its own source of erratic motion.
+#
+# Coarsening to 0.20 m cuts it to ~250 ms worst case and costs essentially nothing
+# in route quality: mean path over the five real victims moves 13.33 -> 13.57 m,
+# under 2%. Inflation still rounds up to a full cell, so clearances do not shrink.
+GRID_RES   = 0.20
 # Hard inflation stays modest so doorways stay open in the plan. On top of it a
 # soft cost gradient (high near walls, decaying out to SOFT_M) makes A* prefer
 # the CENTRE of corridors and only hug a wall at a doorway. Without this the
@@ -186,19 +196,6 @@ INFLATE_M  = ROBOT_RADIUS + 0.06
 WALL_THICK_M = 0.2         # every wall in these worlds is 0.2 m thick (README)
 SOFT_M     = 0.60          # soft-cost radius from walls, metres
 COST_W     = 0.5           # soft-cost weight added to each A* step
-# Price of routing THROUGH a wall the flyover thinks is there, as a multiple of the
-# grid diagonal. It must be decisive, not merely large: at a fixed 40 per cell a
-# crossing priced in like a 24 m detour, and in a 20x36 m world plenty of honest
-# detours are longer than that, so A* kept flipping between crossing and going
-# round - the 5<->12 waypoint oscillation in the logs, with the robot pinned in a
-# 1 m box swinging its heading through 180 degrees.
-#
-# Scaling off the grid diagonal makes one crossing cost more than ANY route that
-# exists in the world, so the planner always prefers a real way round and there is
-# no near-tie to oscillate on. It still crosses when the alternative is no path at
-# all, which is the whole point: finite, never lethal, never stranded. Sized from
-# the grid so it needs no retuning per world.
-WALL_SOFT_MULT = 4.0
 ARRIVE_TOL = 0.60          # metres from the victim estimate to start confirming
 # Nav2-style planner goal tolerance. When the exact goal cell is unreachable
 # (estimate embedded in inflated walls, doorway sealed by sensed obstacles),
@@ -839,18 +836,19 @@ class OccupancyGrid:
         # lidar saw straight through, and the machinery to undo that made the
         # costmap flicker and the routes flip every replan.
         #
-        # So it is kept only as a cost: A* pays WALL_SOFT_COST per cell to cross a
-        # mapped wall, which is worth a detour of tens of metres, so it goes round
-        # through a real doorway whenever one exists and crosses only when the
-        # alternative is not reaching the victim at all. Nothing static is lethal.
-        # What actually stops the robot is the live lidar layer plus the reactive
-        # collision monitor, both of which measure the world instead of guessing it.
+        # Pricing a crossing instead of forbidding it was worse on every count. It
+        # made all 96,000 cells traversable, so A* explored the whole grid and took
+        # 4.6 SECONDS per call, which is what made the simulation stall. Tuning the
+        # price could not win either: too low and it cut through walls, too high and
+        # it behaved as if lethal, and in between it oscillated.
+        #
+        # So walls are lethal again, but permeability is now a per-plan CHOICE. The
+        # normal plan treats them as solid, which keeps the search inside the
+        # corridors and fast. Only if that finds nothing does the planner retry with
+        # them permeable, which is precisely the case the demotion existed for: a
+        # victim behind a wall that the map invented. Fast when the map is right,
+        # never stranded when it is wrong, and nothing to tune.
         self.wall_soft = self.occ.copy()
-        self.occ = np.zeros_like(self.occ)
-        # One crossing must outprice every route the world can contain, so that the
-        # planner never faces a near-tie between crossing and going round.
-        wall_cells = max(1.0, (WALL_THICK_M + 2.0 * INFLATE_M) / self.res)
-        self.wall_cost = (WALL_SOFT_MULT * math.hypot(self.nx, self.ny)) / wall_cells
         self._compute_cost()
 
     def world_to_cell(self, x, y):
@@ -865,18 +863,6 @@ class OccupancyGrid:
 
     def is_free(self, r, c):
         return self.in_bounds(r, c) and self.occ[r, c] == 0
-
-    def los_free(self, r, c):
-        """Free AND not inside a mapped wall. Used only by the Theta* shortcut test.
-
-        Traversability and shortcutting need different answers here. A mapped wall
-        is crossable (it may not exist), so is_free must allow it or the robot gets
-        stranded again. But an any-angle shortcut is drawn as a straight line and
-        its cells are never summed, so letting it cut the corner across a wall
-        silently discards WALL_SOFT_COST and the map stops influencing anything.
-        Shortcuts therefore stop at mapped walls; A* can still route through one at
-        full price when there is genuinely no way round."""
-        return self.is_free(r, c) and self.wall_soft[r, c] == 0
 
     def _stamp_segment(self, x1, y1, x2, y2):
         n = max(1, int(math.hypot(x2 - x1, y2 - y1) / (self.res * 0.5)))
@@ -897,12 +883,13 @@ class OccupancyGrid:
                   max(0, c - rad):min(self.nx, c + rad + 1)] = 1
         self.occ = grown
 
-    def rebuild(self, dyn_mask):
+    def rebuild(self, dyn_mask, walls_lethal=True):
         """Rebuild the lethal layer from SENSED obstacles only, then recompute the
         soft cost (which is where the flyover walls live). A* run after this routes
         around furniture the offline map never saw, and is biased away from mapped
         walls without ever being sealed in by one."""
-        self.occ = np.zeros((self.ny, self.nx), dtype=np.uint8)
+        self.occ = (self.wall_soft.copy() if walls_lethal
+                    else np.zeros((self.ny, self.nx), dtype=np.uint8))
         rad = int(math.ceil(DYN_INFLATE_M / self.res))
         if dyn_mask is not None and dyn_mask.any():
             for r, c in zip(*np.nonzero(dyn_mask)):
@@ -915,6 +902,11 @@ class OccupancyGrid:
         distance to the nearest obstacle; cells within SOFT_M of a wall pay a
         penalty that decays to zero further out. A* then favours corridor
         centres."""
+        soft = SOFT_M / self.res
+        # The gradient is clipped to `soft` cells, so distances beyond it are
+        # discarded anyway. Flooding the whole grid to compute them cost ~200 ms per
+        # rebuild and was a large part of why the simulation stalled; the BFS now
+        # stops at that radius and the result is identical.
         dist = np.full((self.ny, self.nx), 1e9)
         dq = deque()
         for r, c in np.argwhere(self.occ == 1):
@@ -923,16 +915,14 @@ class OccupancyGrid:
         while dq:
             r, c = dq.popleft()
             base = dist[r, c]
+            if base >= soft:
+                continue
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < self.ny and 0 <= nc < self.nx and dist[nr, nc] > base + 1:
                     dist[nr, nc] = base + 1
                     dq.append((nr, nc))
-        soft = SOFT_M / self.res
         self.cost = np.clip(soft - dist, 0.0, soft) * COST_W
-        # Flyover walls enter here and nowhere else: expensive to cross, never
-        # impossible. This is the whole of their influence on planning.
-        self.cost = self.cost + self.wall_soft * self.wall_cost
 
     def nearest_free(self, r, c, max_ring=25):
         if self.is_free(r, c):
@@ -955,7 +945,7 @@ class OccupancyGrid:
             return True
         for i in range(n + 1):
             t = i / n
-            if not self.los_free(int(round(r0 + t * (r1 - r0))),
+            if not self.is_free(int(round(r0 + t * (r1 - r0))),
                                  int(round(c0 + t * (c1 - c0)))):
                 return False
         return True
@@ -975,7 +965,7 @@ def _line_of_sight(grid, a, b):
     sr = 1 if r1 > r0 else -1
     sc = 1 if c1 > c0 else -1
     r, c = r0, c0
-    if not grid.los_free(r, c):
+    if not grid.is_free(r, c):
         return False
     err = dr - dc
     guard = 0
@@ -984,7 +974,7 @@ def _line_of_sight(grid, a, b):
         e2 = 2 * err
         if e2 > -dc and e2 < dr:
             # exact diagonal step: both clipped neighbours must also be free
-            if not (grid.los_free(r + sr, c) and grid.los_free(r, c + sc)):
+            if not (grid.is_free(r + sr, c) and grid.is_free(r, c + sc)):
                 return False
             r += sr
             c += sc
@@ -995,7 +985,7 @@ def _line_of_sight(grid, a, b):
         else:
             err += dr
             c += sc
-        if not grid.los_free(r, c):
+        if not grid.is_free(r, c):
             return False
     return True
 
@@ -2860,15 +2850,34 @@ class GroundMission:
                 mask[r, c] = False
         return mask
 
-    def _fused_rebuild(self):
-        self.grid.rebuild(self._dyn_mask())
+    def _fused_rebuild(self, walls_lethal=True):
+        self.grid.rebuild(self._dyn_mask(), walls_lethal)
 
     def plan_to(self, gx, gy):
-        """Replan on the fused map (static walls + sensed obstacles). Returns
-        False if no path exists, e.g. furniture fully blocks the victim."""
-        self._fused_rebuild()
+        """Replan on the fused map. Two passes.
+
+        Pass 1 treats the flyover walls as solid. That is the normal case and it is
+        the fast one, because the search stays inside the corridors instead of
+        spreading over the whole grid.
+
+        Pass 2 runs only when pass 1 finds nothing, and lets the route cross a
+        mapped wall. The flyover map is about a metre out in places and invents
+        walls that are not there, so "no path" is far more often a defect in the map
+        than a fact about the world, and refusing to move is the one outcome we
+        cannot recover from. Anything really in the way is still lethal in both
+        passes: it comes from the live lidar layer, not the map.
+
+        Returns False only when even the permeable pass finds nothing."""
         self.last_replan = self.robot.getTime()
+        self._fused_rebuild()
         path = astar(self.grid, (self.x, self.y), (gx, gy))
+        if path is None:
+            self._fused_rebuild(walls_lethal=False)
+            path = astar(self.grid, (self.x, self.y), (gx, gy))
+            if path is not None:
+                print(f"[{self.name}] no route with the flyover walls solid; "
+                      f"routing THROUGH one to ({gx:.2f},{gy:.2f})")
+            self._fused_rebuild()      # restore the normal map for DWA and checks
         if path is None:
             return False
         self.path = path

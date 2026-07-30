@@ -25,6 +25,7 @@ import csv
 import json
 import math
 import os
+import sys
 
 import cv2
 import numpy as np
@@ -59,10 +60,36 @@ def _find_competition_root(start):
 _COMP_ROOT = _find_competition_root(_SRC_DIR)
 
 # ---- inputs ----
-# CHANGE ONLY THIS LINE to switch worlds. The IMU csv, the per-world cache folder
-# and the per-world output folder are all derived from it, so every world keeps its
-# own results and an already-processed world replays instantly.
-VIDEO_PATH  = os.path.join(_COMP_ROOT, "recordings", "large_world_flyover.mp4")
+def _cli_flag(name):
+    """True when a bare flag is present on the command line."""
+    return name in sys.argv[1:]
+
+
+def _cli_value(*names):
+    """Value of '--opt VALUE' or '--opt=VALUE', or None.
+
+    Parsed by hand rather than with argparse because this module is also imported
+    by evaluate_estimates.py: argparse would reject or consume that script's own
+    arguments. Unknown arguments are ignored here."""
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        for n in names:
+            if a == n and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
+# The world to process. Defaults to large_world, and is overridden by
+# "--file <path>" so the whole pipeline is a single command with no source edits.
+# A relative path is taken relative to the competition folder.
+_DEFAULT_VIDEO = os.path.join(_COMP_ROOT, "recordings", "large_world_flyover.mp4")
+_cli_video = _cli_value("--file", "-f")
+if _cli_video:
+    VIDEO_PATH = _cli_video if os.path.isabs(_cli_video) else         os.path.join(_COMP_ROOT, _cli_video)
+else:
+    VIDEO_PATH = _DEFAULT_VIDEO
 
 # "large_world_flyover.mp4" -> "large_world". Used as the per-world folder name.
 WORLD = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
@@ -206,8 +233,8 @@ NADIR_KEEP_MIN   = 8      # ...but never fewer than this many
 USE_BOX_FOOTPRINT = True
 
 
-FORCE_ODOMETRY = False       # redo stage 1 even if camera_poses.csv exists
-FORCE_MAPPING  = False        # redo stage 2 even if wall_raw.npy exists
+FORCE_ODOMETRY = _cli_flag("--force")        # redo stage 1 even if camera_poses.csv exists
+FORCE_MAPPING  = _cli_flag("--force-map")    # redo stage 2 even if wall_raw.npy exists
 SHOW_PLOTS     = False        # stage 1 matplotlib windows (figure is saved anyway)
 
 # ---- fused stage 1+2 (single pass over the video) ----

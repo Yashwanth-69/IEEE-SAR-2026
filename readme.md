@@ -32,17 +32,23 @@ which the pipeline needs to establish the origin-marker reference frame.
 
 ### Step 1 — process the flyover footage
 
+**This is the one-line pre-processing command, run before each simulation:**
+
 ```bash
-python src/sar_pipeline.py
+python src/sar_pipeline.py --file recordings/large_world_flyover.mp4
 ```
 
-The world is selected by a single line at the top of `src/sar_pipeline.py`:
+The path may be absolute or relative to the competition folder. Everything else
+(the IMU csv, the per-world cache folder, the per-world output folder) is derived
+from that filename, so no source edit is needed to change worlds.
 
-```python
-VIDEO_PATH = os.path.join(_COMP_ROOT, "recordings", "large_world_flyover.mp4")
-```
+| Option | Effect |
+|---|---|
+| `--file <video>` | flyover footage to process; selects the world |
+| `--force` | redo the odometry pass even if a cache exists |
+| `--force-map` | redo the wall-mapping stage even if a cache exists |
 
-Everything else (IMU csv, cache folder, output folder) is derived from that name.
+With no arguments it defaults to `large_world`.
 
 - **First run for a world** performs the full video pass (several minutes) and
   writes the deliverables plus a reusable cache.
@@ -132,14 +138,17 @@ Both robots run from one controller, distinguished by name.
 - **Task allocation** — victims are split by a greedy route-cost balance so both
   robots start on a nearby victim and carry comparable travel, which serves both
   the coordination and efficiency criteria.
-- **Global planning** — A* over a layered costmap (static walls from the flyover
-  map, plus a live log-odds obstacle layer from lidar and depth). Routes are
-  committed rather than replaced on every replan, so a flickering costmap cell
-  cannot flip the robot between two equal-cost ways around an obstacle.
-- **Local planning** — Dynamic Window Approach for velocity selection, with
-  Follow-the-Gap supplying the heading in clutter. Gap geometry is read directly
-  off the scan in one pass, which avoids the stall that pure trajectory sampling
-  hits in narrow openings.
+- **Global planning** — any-angle **Theta\*** over a layered costmap (static walls
+  from the flyover map, plus a live log-odds obstacle layer from lidar and depth).
+  Reparenting a cell to its grandparent whenever the two have line of sight frees
+  the route from 45° grid headings, giving straight runs instead of staircases and
+  far fewer corners for the follower to slow down for. Routes are committed rather
+  than replaced on every replan, so a flickering costmap cell cannot flip the robot
+  between two near-equal ways around an obstacle.
+- **Local planning** — Dynamic Window Approach for velocity selection, following
+  the path with a velocity-scaled pure-pursuit lookahead. Follow-the-Gap heading
+  selection is available for cluttered openings, reading gap geometry off the scan
+  in one pass.
 - **Safety** — a reactive collision monitor below the planner fuses lidar, the
   depth camera (for obstacles above or below the lidar plane) and the IR ring.
   Wheel-slip and tip-over are detected from the scan and the accelerometer, and
@@ -168,8 +177,8 @@ Pipeline (`src/sar_pipeline.py`):
 
 | Setting | Purpose |
 |---|---|
-| `VIDEO_PATH` | selects the world; everything else derives from it |
-| `FORCE_ODOMETRY` | redo the video pass even if a cache exists |
+| `--file` | selects the world; everything else derives from it |
+| `--force` | redo the video pass even if a cache exists |
 | `VICTIM_CONF` | detector confidence floor for flyover victims |
 | `MIN_DETECTION_HITS` | frames a cluster needs before it counts as a victim |
 

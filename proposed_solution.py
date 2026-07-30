@@ -183,14 +183,22 @@ GRID_RES   = 0.10
 # the CENTRE of corridors and only hug a wall at a doorway. Without this the
 # path grazed walls the whole way and the robots ground against them.
 INFLATE_M  = ROBOT_RADIUS + 0.06
+WALL_THICK_M = 0.2         # every wall in these worlds is 0.2 m thick (README)
 SOFT_M     = 0.60          # soft-cost radius from walls, metres
 COST_W     = 0.5           # soft-cost weight added to each A* step
-# Price of routing THROUGH a wall the flyover thinks is there. A* steps cost about
-# 1.0 per cell (GRID_RES), so at 40 per cell a ~6-cell wall crossing prices in like
-# a 24 m detour: the planner takes any real way round it, and crosses only when the
-# alternative is failing to reach the victim at all. Finite on purpose - a hard
-# block here is what stranded the robots behind walls that were never there.
-WALL_SOFT_COST = 40.0
+# Price of routing THROUGH a wall the flyover thinks is there, as a multiple of the
+# grid diagonal. It must be decisive, not merely large: at a fixed 40 per cell a
+# crossing priced in like a 24 m detour, and in a 20x36 m world plenty of honest
+# detours are longer than that, so A* kept flipping between crossing and going
+# round - the 5<->12 waypoint oscillation in the logs, with the robot pinned in a
+# 1 m box swinging its heading through 180 degrees.
+#
+# Scaling off the grid diagonal makes one crossing cost more than ANY route that
+# exists in the world, so the planner always prefers a real way round and there is
+# no near-tie to oscillate on. It still crosses when the alternative is no path at
+# all, which is the whole point: finite, never lethal, never stranded. Sized from
+# the grid so it needs no retuning per world.
+WALL_SOFT_MULT = 4.0
 ARRIVE_TOL = 0.60          # metres from the victim estimate to start confirming
 # Nav2-style planner goal tolerance. When the exact goal cell is unreachable
 # (estimate embedded in inflated walls, doorway sealed by sensed obstacles),
@@ -839,6 +847,10 @@ class OccupancyGrid:
         # collision monitor, both of which measure the world instead of guessing it.
         self.wall_soft = self.occ.copy()
         self.occ = np.zeros_like(self.occ)
+        # One crossing must outprice every route the world can contain, so that the
+        # planner never faces a near-tie between crossing and going round.
+        wall_cells = max(1.0, (WALL_THICK_M + 2.0 * INFLATE_M) / self.res)
+        self.wall_cost = (WALL_SOFT_MULT * math.hypot(self.nx, self.ny)) / wall_cells
         self._compute_cost()
 
     def world_to_cell(self, x, y):
@@ -920,7 +932,7 @@ class OccupancyGrid:
         self.cost = np.clip(soft - dist, 0.0, soft) * COST_W
         # Flyover walls enter here and nowhere else: expensive to cross, never
         # impossible. This is the whole of their influence on planning.
-        self.cost = self.cost + self.wall_soft * WALL_SOFT_COST
+        self.cost = self.cost + self.wall_soft * self.wall_cost
 
     def nearest_free(self, r, c, max_ring=25):
         if self.is_free(r, c):

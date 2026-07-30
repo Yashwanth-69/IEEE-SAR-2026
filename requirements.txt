@@ -1,0 +1,29 @@
+# IEEE SMCS SAR Competition 2026 - Phase 1 submission
+# Python 3.11 (any 3.10+ works)
+#
+#   python -m venv .venv
+#   .venv/Scripts/activate      # Windows
+#   pip install -r requirements.txt
+
+# Numerics, used by both the flyover pipeline and the ground controller.
+numpy>=1.26,<3
+
+# Video decoding, image processing, ArUco detection (used to establish the
+# origin-marker reference frame and the flyover altitude) and the debug map
+# windows. The contrib build is pinned because it guarantees cv2.aruco is present
+# on every OpenCV version; install ONLY this one, as having both opencv-python and
+# opencv-contrib-python in the same environment can shadow each other.
+opencv-contrib-python>=4.8
+
+# Flyover IMU telemetry loading (pipeline only).
+pandas>=2.0
+
+# Trajectory verification figure written during flyover odometry (pipeline only).
+matplotlib>=3.7
+
+# YOLO person detection: victims in the flyover footage and from the ground
+# robots' cameras. Pulls in torch automatically.
+ultralytics>=8.3
+
+# Used by the competition's own marking supervisor controller.
+pillow>=10.0

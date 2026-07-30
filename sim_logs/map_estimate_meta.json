@@ -1,0 +1,10 @@
+{
+  "resolution_m_per_px": 0.05,
+  "size_px": 600,
+  "origin_px": [
+    282.5,
+    524.0
+  ],
+  "y_up": true,
+  "frame": "origin_marker"
+}

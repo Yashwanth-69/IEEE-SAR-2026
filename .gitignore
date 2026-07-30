@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+run_logs/
+*.log
+# Regenerable per-world pipeline caches (rebuilt by src/sar_pipeline.py)
+src/*_world/

@@ -2920,15 +2920,17 @@ class GroundMission:
     def plan_to_victim(self, v):
         """Plan to the victim's approach standoff (not the body coordinate). The
         victim is carved out of the obstacle layer first so the standoff and the
-        path leading to it sit in genuinely free space."""
+        path leading to it sit in genuinely free space.
+
+        Delegates to plan_to rather than calling astar itself. It used to call it
+        directly, which quietly skipped the permeable second pass: a victim behind a
+        wall the flyover invented came back as "no path" and was ABANDONED, which is
+        how a robot ended a run in EXPLORE with two victims written off. Every route
+        in this controller now goes through one function, so a planner fix cannot
+        land in one copy and miss another."""
         self._fused_rebuild()
         gx, gy = self._approach_goal(v["x"], v["y"])
-        self.last_replan = self.robot.getTime()
-        path = astar(self.grid, (self.x, self.y), (gx, gy))
-        if path is None:
-            return False
-        self.path = path
-        return True
+        return self.plan_to(gx, gy)
 
     def plan_safe_road_to(self, v):
         """Route to the victim along the shared safe road: a graph over the

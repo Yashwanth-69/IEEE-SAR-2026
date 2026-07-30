@@ -185,6 +185,12 @@ GRID_RES   = 0.10
 INFLATE_M  = ROBOT_RADIUS + 0.06
 SOFT_M     = 0.60          # soft-cost radius from walls, metres
 COST_W     = 0.5           # soft-cost weight added to each A* step
+# Price of routing THROUGH a wall the flyover thinks is there. A* steps cost about
+# 1.0 per cell (GRID_RES), so at 40 per cell a ~6-cell wall crossing prices in like
+# a 24 m detour: the planner takes any real way round it, and crosses only when the
+# alternative is failing to reach the victim at all. Finite on purpose - a hard
+# block here is what stranded the robots behind walls that were never there.
+WALL_SOFT_COST = 40.0
 ARRIVE_TOL = 0.60          # metres from the victim estimate to start confirming
 # Nav2-style planner goal tolerance. When the exact goal cell is unreachable
 # (estimate embedded in inflated walls, doorway sealed by sensed obstacles),
@@ -298,30 +304,6 @@ OBS_MAX_RANGE   = 2.5         # mark hits closer than this; clear out to here, m
 OBS_UPDATE_S    = 0.10        # min seconds between obstacle-layer updates
 REPLAN_PERIOD_S = 1.5         # replan on the fused map at least this often
 
-# Disproving the flyover wall map.
-#
-# The flyover map is a PRIOR, not ground truth. Scored against the true world
-# layout it sits about a metre out in places and contains walls that are not there
-# at all: on large_world it draws roughly a third more wall pixels than exist,
-# because every wall is stamped using a UAV pose that drifted. Treated as immutable
-# geometry it walls the robot in behind obstacles its own lidar sees straight
-# through, which is exactly what the run logs show - lidar and depth both reading
-# max range in every direction while the planner insists there is no route, the
-# robot thrashing on the spot until the mission times out.
-#
-# So a static wall cell can be DISPROVEN. Every beam that passes cleanly through
-# such a cell and terminates well beyond it is one vote that the cell is wrong;
-# enough independent votes and it stops blocking the plan. A real wall can never
-# collect them, because it stops the beam that would have to pass through it.
-#
-# Being wrong in this direction is the recoverable one. The reactive collision
-# monitor sits below the planner and is what actually prevents contact, so an
-# optimistic plan gets stopped at the wall; a pessimistic plan strands the robot
-# with no way to discover it was wrong.
-WALL_DOUBT_HIT      = 1.0     # votes added per clean see-through
-WALL_DOUBT_CLEAR    = 12.0    # votes before the cell stops blocking planning
-WALL_DOUBT_MARGIN_M = 0.40    # beam must terminate this far beyond the cell to vote
-WALL_DOUBT_DECAY    = 0.999   # votes bleed off slowly, so evidence must be sustained
 # Path hysteresis. A* is re-run periodically on a costmap that changes as the
 # lidar and depth camera stamp cells, and two routes around an obstacle can have
 # nearly equal cost. Accepting every new plan therefore lets a single flickering
@@ -842,7 +824,21 @@ class OccupancyGrid:
         for x1, y1, x2, y2 in walls:
             self._stamp_segment(x1, y1, x2, y2)
         self._inflate(INFLATE_M)
-        self.static_occ = self.occ.copy()   # walls only, the static map layer
+        # The flyover wall map is a HINT, not geometry. Scored against the true
+        # layout it sits about a metre out in places and draws roughly a third more
+        # wall than exists, because every wall is stamped with a UAV pose that
+        # drifted. Held as lethal it walled the robots in behind obstacles their own
+        # lidar saw straight through, and the machinery to undo that made the
+        # costmap flicker and the routes flip every replan.
+        #
+        # So it is kept only as a cost: A* pays WALL_SOFT_COST per cell to cross a
+        # mapped wall, which is worth a detour of tens of metres, so it goes round
+        # through a real doorway whenever one exists and crosses only when the
+        # alternative is not reaching the victim at all. Nothing static is lethal.
+        # What actually stops the robot is the live lidar layer plus the reactive
+        # collision monitor, both of which measure the world instead of guessing it.
+        self.wall_soft = self.occ.copy()
+        self.occ = np.zeros_like(self.occ)
         self._compute_cost()
 
     def world_to_cell(self, x, y):
@@ -857,6 +853,18 @@ class OccupancyGrid:
 
     def is_free(self, r, c):
         return self.in_bounds(r, c) and self.occ[r, c] == 0
+
+    def los_free(self, r, c):
+        """Free AND not inside a mapped wall. Used only by the Theta* shortcut test.
+
+        Traversability and shortcutting need different answers here. A mapped wall
+        is crossable (it may not exist), so is_free must allow it or the robot gets
+        stranded again. But an any-angle shortcut is drawn as a straight line and
+        its cells are never summed, so letting it cut the corner across a wall
+        silently discards WALL_SOFT_COST and the map stops influencing anything.
+        Shortcuts therefore stop at mapped walls; A* can still route through one at
+        full price when there is genuinely no way round."""
+        return self.is_free(r, c) and self.wall_soft[r, c] == 0
 
     def _stamp_segment(self, x1, y1, x2, y2):
         n = max(1, int(math.hypot(x2 - x1, y2 - y1) / (self.res * 0.5)))
@@ -877,28 +885,17 @@ class OccupancyGrid:
                   max(0, c - rad):min(self.nx, c + rad + 1)] = 1
         self.occ = grown
 
-    def rebuild(self, dyn_mask, disproven=None):
-        """Fuse the live obstacle layer into the plan: union the static walls
-        with the sensed obstacles (inflated by the robot radius), then recompute
-        the soft cost. A* run after this routes around furniture the offline map
-        never saw.
-
-        `disproven` are static cells the lidar has repeatedly seen through. They
-        are dropped from the static layer BEFORE the sensed obstacles are merged
-        in, so a phantom wall stops blocking the plan while anything actually
-        sensed at those cells still does."""
-        static = self.static_occ
-        if disproven is not None and disproven.any():
-            static = np.where(disproven, 0, static).astype(np.uint8)
+    def rebuild(self, dyn_mask):
+        """Rebuild the lethal layer from SENSED obstacles only, then recompute the
+        soft cost (which is where the flyover walls live). A* run after this routes
+        around furniture the offline map never saw, and is biased away from mapped
+        walls without ever being sealed in by one."""
+        self.occ = np.zeros((self.ny, self.nx), dtype=np.uint8)
         rad = int(math.ceil(DYN_INFLATE_M / self.res))
         if dyn_mask is not None and dyn_mask.any():
-            dil = np.zeros_like(static)
             for r, c in zip(*np.nonzero(dyn_mask)):
-                dil[max(0, r - rad):min(self.ny, r + rad + 1),
-                    max(0, c - rad):min(self.nx, c + rad + 1)] = 1
-            self.occ = (static | dil).astype(np.uint8)
-        else:
-            self.occ = static.copy()
+                self.occ[max(0, r - rad):min(self.ny, r + rad + 1),
+                         max(0, c - rad):min(self.nx, c + rad + 1)] = 1
         self._compute_cost()
 
     def _compute_cost(self):
@@ -921,6 +918,9 @@ class OccupancyGrid:
                     dq.append((nr, nc))
         soft = SOFT_M / self.res
         self.cost = np.clip(soft - dist, 0.0, soft) * COST_W
+        # Flyover walls enter here and nowhere else: expensive to cross, never
+        # impossible. This is the whole of their influence on planning.
+        self.cost = self.cost + self.wall_soft * WALL_SOFT_COST
 
     def nearest_free(self, r, c, max_ring=25):
         if self.is_free(r, c):
@@ -933,6 +933,9 @@ class OccupancyGrid:
         return r, c
 
     def line_of_sight(self, a, b):
+        """Used by the waypoint smoother. Like the Theta* test it must respect
+        mapped walls: collapsing two waypoints into a straight line across one
+        would undo the detour A* just paid WALL_SOFT_COST to plan."""
         r0, c0 = a
         r1, c1 = b
         n = max(abs(r1 - r0), abs(c1 - c0))
@@ -940,8 +943,8 @@ class OccupancyGrid:
             return True
         for i in range(n + 1):
             t = i / n
-            if not self.is_free(int(round(r0 + t * (r1 - r0))),
-                                int(round(c0 + t * (c1 - c0)))):
+            if not self.los_free(int(round(r0 + t * (r1 - r0))),
+                                 int(round(c0 + t * (c1 - c0)))):
                 return False
         return True
 
@@ -960,7 +963,7 @@ def _line_of_sight(grid, a, b):
     sr = 1 if r1 > r0 else -1
     sc = 1 if c1 > c0 else -1
     r, c = r0, c0
-    if not grid.is_free(r, c):
+    if not grid.los_free(r, c):
         return False
     err = dr - dc
     guard = 0
@@ -969,7 +972,7 @@ def _line_of_sight(grid, a, b):
         e2 = 2 * err
         if e2 > -dc and e2 < dr:
             # exact diagonal step: both clipped neighbours must also be free
-            if not (grid.is_free(r + sr, c) and grid.is_free(r, c + sc)):
+            if not (grid.los_free(r + sr, c) and grid.los_free(r, c + sc)):
                 return False
             r += sr
             c += sc
@@ -980,7 +983,7 @@ def _line_of_sight(grid, a, b):
         else:
             err += dr
             c += sc
-        if not grid.is_free(r, c):
+        if not grid.los_free(r, c):
             return False
     return True
 
@@ -1367,17 +1370,6 @@ class GroundMission:
                                   [(v["x"], v["y"]) for v in self.victims],
                                   self.start_xy)
         self.obs_score = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
-        # See-through evidence against the flyover map's static walls.
-        self.wall_doubt = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
-        # Disproving LATCHES. Votes decay, so a cell hovering at the threshold used
-        # to cross back and forth and re-block: measured over one run, 46 of 66
-        # updates went DOWN, and every flicker rebuilt the costmap and handed A* a
-        # different route. That is what made the robot U-turn, re-approach and
-        # U-turn again. Decay still stops scattered noise ever reaching the
-        # threshold; once a cell does cross it, the verdict stands. Anything really
-        # there is still caught by the live obstacle layer, which is unaffected.
-        self.wall_free = np.zeros((self.grid.ny, self.grid.nx), dtype=bool)
-        self.wall_cleared = 0        # how many static cells we have disproven
         self.map_bounds = self._compute_map_bounds()
         self.explore_targets = self._my_explore_targets()
         self.explore_remaining = list(self.explore_targets)
@@ -2799,7 +2791,6 @@ class GroundMission:
             return
         self.last_obs_update = now
         self.obs_score *= OBS_DECAY          # tiny fade, only for drift smears
-        self.wall_doubt *= WALL_DOUBT_DECAY  # evidence must be sustained, not stale
         angs, rs = self.read_lidar()
         g = self.grid
         tv = self._target_victim_xy()        # never mark the victim we approach
@@ -2809,20 +2800,12 @@ class GroundMission:
             ex = self.x + clear_d * math.cos(self.theta + a)
             ey = self.y + clear_d * math.sin(self.theta + a)
             r1, c1 = g.world_to_cell(ex, ey)
-            # Clear the free space the beam travelled through (self-corrects marks
-            # that have moved or were noise). A static wall cell is not cleared
-            # here, but every beam that passed cleanly through it and ended well
-            # beyond votes that the flyover map put a wall where there is none.
-            cells = self._ray_cells(r0, c0, r1, c1)
-            span = max(1, len(cells) - 1)
-            vote_upto = clear_d - WALL_DOUBT_MARGIN_M
-            for i, (rr, cc) in enumerate(cells):
-                if not g.in_bounds(rr, cc):
-                    continue
-                if not g.static_occ[rr, cc]:
+            # Clear the free space the beam travelled through. This self-corrects
+            # marks that moved or were noise, and needs no exception for the flyover
+            # walls any more: they are a cost now, not part of this layer at all.
+            for (rr, cc) in self._ray_cells(r0, c0, r1, c1):
+                if g.in_bounds(rr, cc):
                     self.obs_score[rr, cc] = max(0.0, self.obs_score[rr, cc] - OBS_MISS)
-                elif clear_d * i / span <= vote_upto:
-                    self.wall_doubt[rr, cc] += WALL_DOUBT_HIT
             # Mark the hit cell itself (only real, close returns).
             if d >= OBS_MAX_RANGE:
                 continue
@@ -2831,7 +2814,7 @@ class GroundMission:
             if tv is not None and math.hypot(wx - tv[0], wy - tv[1]) < VICTIM_CLEAR_R:
                 continue   # this hit is the target's own body: it is the goal
             r, c = g.world_to_cell(wx, wy)
-            if g.in_bounds(r, c) and not g.static_occ[r, c]:
+            if g.in_bounds(r, c):
                 self.obs_score[r, c] = min(OBS_MAX, self.obs_score[r, c] + OBS_HIT)
 
         # Depth camera: mark obstacles at camera height the lidar plane misses
@@ -2847,7 +2830,7 @@ class GroundMission:
             if tv is not None and math.hypot(wx - tv[0], wy - tv[1]) < VICTIM_CLEAR_R:
                 continue
             r, c = g.world_to_cell(wx, wy)
-            if g.in_bounds(r, c) and not g.static_occ[r, c]:
+            if g.in_bounds(r, c):
                 self.obs_score[r, c] = min(OBS_MAX, self.obs_score[r, c] + OBS_HIT)
 
     def _dyn_mask(self):
@@ -2865,25 +2848,8 @@ class GroundMission:
                 mask[r, c] = False
         return mask
 
-    def _disproven_mask(self):
-        """Static wall cells the lidar has seen through often enough to overrule
-        the flyover map. Returns None until at least one cell qualifies."""
-        if self.wall_doubt is None:
-            return None
-        newly = self.wall_doubt >= WALL_DOUBT_CLEAR
-        if newly.any():
-            self.wall_free |= newly        # latched: a verdict is never taken back
-        n = int(self.wall_free.sum())
-        if n == 0:
-            return None
-        if n != self.wall_cleared:
-            print(f"[{self.name}] flyover map: {n} static wall cells disproven by "
-                  f"lidar see-through (was {self.wall_cleared}); replanning through them")
-            self.wall_cleared = n
-        return self.wall_free
-
     def _fused_rebuild(self):
-        self.grid.rebuild(self._dyn_mask(), self._disproven_mask())
+        self.grid.rebuild(self._dyn_mask())
 
     def plan_to(self, gx, gy):
         """Replan on the fused map (static walls + sensed obstacles). Returns

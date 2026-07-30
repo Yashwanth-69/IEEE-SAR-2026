@@ -170,8 +170,16 @@ Both robots run from one controller, distinguished by name.
 - **Task allocation** — victims are split by a greedy route-cost balance so both
   robots start on a nearby victim and carry comparable travel, which serves both
   the coordination and efficiency criteria.
-- **Global planning** — any-angle **Theta\*** over a layered costmap (static walls
-  from the flyover map, plus a live log-odds obstacle layer from lidar and depth).
+- **Global planning** — any-angle **Theta\*** over a layered costmap. Only what the
+  robot has actually sensed is lethal: the live log-odds layer from lidar and depth.
+  The flyover wall map is a **prior, not geometry** — it enters as a cost the
+  planner pays to cross (worth a detour of tens of metres), so routes respect it
+  whenever a real way round exists and cross it rather than failing when one does
+  not. This matters because the flyover map is the least reliable input in the
+  system, off by about a metre in places with walls that are not there at all;
+  treated as lethal it sealed robots behind obstacles their own lidar could see
+  straight through. The Theta\* shortcut and the waypoint smoother both refuse to
+  cut across a mapped wall, so the cost cannot be silently erased by smoothing.
   Reparenting a cell to its grandparent whenever the two have line of sight frees
   the route from 45° grid headings, giving straight runs instead of staircases and
   far fewer corners for the follower to slow down for. Routes are committed rather

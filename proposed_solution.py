@@ -1369,6 +1369,14 @@ class GroundMission:
         self.obs_score = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
         # See-through evidence against the flyover map's static walls.
         self.wall_doubt = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
+        # Disproving LATCHES. Votes decay, so a cell hovering at the threshold used
+        # to cross back and forth and re-block: measured over one run, 46 of 66
+        # updates went DOWN, and every flicker rebuilt the costmap and handed A* a
+        # different route. That is what made the robot U-turn, re-approach and
+        # U-turn again. Decay still stops scattered noise ever reaching the
+        # threshold; once a cell does cross it, the verdict stands. Anything really
+        # there is still caught by the live obstacle layer, which is unaffected.
+        self.wall_free = np.zeros((self.grid.ny, self.grid.nx), dtype=bool)
         self.wall_cleared = 0        # how many static cells we have disproven
         self.map_bounds = self._compute_map_bounds()
         self.explore_targets = self._my_explore_targets()
@@ -2862,15 +2870,17 @@ class GroundMission:
         the flyover map. Returns None until at least one cell qualifies."""
         if self.wall_doubt is None:
             return None
-        mask = self.wall_doubt >= WALL_DOUBT_CLEAR
-        n = int(mask.sum())
+        newly = self.wall_doubt >= WALL_DOUBT_CLEAR
+        if newly.any():
+            self.wall_free |= newly        # latched: a verdict is never taken back
+        n = int(self.wall_free.sum())
         if n == 0:
             return None
         if n != self.wall_cleared:
             print(f"[{self.name}] flyover map: {n} static wall cells disproven by "
                   f"lidar see-through (was {self.wall_cleared}); replanning through them")
             self.wall_cleared = n
-        return mask
+        return self.wall_free
 
     def _fused_rebuild(self):
         self.grid.rebuild(self._dyn_mask(), self._disproven_mask())
@@ -3253,9 +3263,23 @@ class GroundMission:
         dist = self.navigate(self.path)
         if self.need_replan:
             self.need_replan = False
+            # A recovery just finished. This replan used to be unconditional, which
+            # is where the U-turns came from: recoveries fire in bursts, and each one
+            # was free to hand back a route around the OTHER side of the obstacle,
+            # so the robot committed, turned around, recovered, and committed back.
+            # Hysteresis matters more here than on the periodic replan, not less.
+            old_path = list(self.path)
+            old_ok = self._path_is_clear(old_path)
+            old_len = self._path_len(old_path) if old_ok else float("inf")
             if not self.replan_to_victim():
-                self._skip_victim(self.target)
-                self.state = "PLAN"
+                if old_ok:
+                    self.path = old_path
+                else:
+                    self._skip_victim(self.target)
+                    self.state = "PLAN"
+            elif old_ok and not self.on_safe_road:
+                if self._path_len(self.path) > (1.0 - PATH_SWITCH_MARGIN) * old_len:
+                    self.path = old_path      # recovery does not license a new route
             return
         if dist < ARRIVE_TOL:
             self._enter_confirm()

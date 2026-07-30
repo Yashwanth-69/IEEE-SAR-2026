@@ -463,7 +463,13 @@ CONFIRM_SEARCH_SPIN = 2.5    # wheel rad/s in-place scan when parked on an empty
 CONFIRM_DIST_THRESH = 0.55   # sensor distance in the box direction under which a seen victim is FOUND.
                              # Lowered so a VISIBLE victim keeps getting creeped up on (drift-immune,
                              # driven by live lidar/depth to the body) instead of holding 0.8 m out.
-CONFIRM_MIN_CLEAR   = 0.50   # Hard clearance floor to the nearest surface. The collision
+# Standoff. The robot body is only ROBOT_RADIUS (0.13 m), so a 0.50 m floor was
+# holding it 0.37 m clear of the victim on top of its own radius, and that standoff
+# is subtracted directly from scoring margin: the logged approaches stopped 1.1-1.9 m
+# from the estimate with the lidar reading 0.2-0.5 m, i.e. parked well short of a
+# body it had already reached. Dropped to leave roughly 0.17 m of air beyond the
+# robot's own radius, which is still clear of the mesh but much nearer the centroid.
+CONFIRM_MIN_CLEAR   = 0.30   # Hard clearance floor to the nearest surface. The collision
                              # monitor deliberately carves the target victim out of its
                              # obstacle set so the victim is a goal rather than something
                              # to avoid, which leaves THIS as the only thing keeping the
@@ -472,9 +478,11 @@ CONFIRM_MIN_CLEAR   = 0.50   # Hard clearance floor to the nearest surface. The 
                              # a tipped robot. Scoring is measured to the waist marker,
                              # which sits inside the body, so half a metre of standoff is
                              # still comfortably inside the 1.0 m radius.
-CONFIRM_SLOW_M      = 0.90   # start decelerating the approach at this clearance. Arriving at
+CONFIRM_SLOW_M      = 0.70   # start decelerating the approach at this clearance. Arriving at
                              # full creep speed and stopping abruptly is what tips the robot
                              # or climbs it onto an obstacle; easing in costs no closeness.
+CONFIRM_RETREAT_M   = 0.25   # only back out to the pre-approach point if we crept
+                             # at least this far past it while closing on the body
 CONFIRM_CREEP_MIN   = 0.25   # floor on the speed scale, as a fraction of CONFIRM_SPEED
 CONFIRM_TARGET_M    = 0.25   # when we do NOT see the victim, keep closing on the estimate until
                              # THIS near or the anti-stomp floor stops us. Deliberately below
@@ -1141,6 +1149,7 @@ class GroundMission:
 
         # Inter-robot state.
         self.other_pos = None
+        self.confirm_safe_xy = None      # pre-approach standoff to retreat to
         self.other_claim = None
         self.other_claim_id = None
         self.trail = []              # breadcrumbs this robot has proven free
@@ -3130,6 +3139,15 @@ class GroundMission:
             self.state = "EXPLORE"
             return
         if self.plan_to_victim(self.target):
+            # Back out to the pre-approach standoff before setting off, so we never
+            # try to drive a fresh route out of a pose pressed against a victim.
+            if self.confirm_safe_xy is not None:
+                sx, sy = self.confirm_safe_xy
+                if math.hypot(sx - self.x, sy - self.y) > CONFIRM_RETREAT_M:
+                    self.path.insert(0, (sx, sy))
+                    print(f"[{self.name}] retreating to safe point "
+                          f"({sx:.2f},{sy:.2f}) before the next victim")
+                self.confirm_safe_xy = None
             print(f"[{self.name}] planning to victim #{self.target.get('id')} "
                   f"({self.target['x']:.2f},{self.target['y']:.2f}), "
                   f"{len(self.path)} waypoints")
@@ -3145,6 +3163,13 @@ class GroundMission:
         self.stop()
         self.path = []
         self.on_safe_road = False
+        # Retreat point. The robot drove to this spot under the planner, so it is
+        # known clear, and it is recorded BEFORE the final creep into the body.
+        # Closing right up to a victim otherwise leaves the next plan starting from
+        # a pose wedged against the mesh, where every rollout is blocked and the
+        # robot burns the rest of the mission thrashing. Backing out to here first
+        # costs one waypoint and always succeeds, because we came in that way.
+        self.confirm_safe_xy = (self.x, self.y)
         self.confirm_start = self.robot.getTime()
         self.confirm_close_since = -1.0
         self.confirm_min_dv = float("inf")

@@ -2061,16 +2061,29 @@ class GroundMission:
         # Goal-progress check. The test above only asks "did we move?", which the
         # logs showed a crawling robot passing while it drove AWAY from its goal.
         # This asks the question that matters: "are we getting CLOSER?"
+        # Progress is measured ALONG THE PATH, not as straight-line distance to the
+        # goal. Those are not the same thing, and the difference was costing whole
+        # missions: a robot correctly routing around a wall closes no straight-line
+        # distance for as long as the detour lasts, and often moves away from the
+        # goal. The old test called that "no progress" and fired a recovery - which
+        # rotates in place, which really does make no progress, which failed the
+        # next window too. Nine recoveries and 40 s of spinning on the spot in one
+        # 112 s drive, with the recovery itself the thing preventing progress.
+        #
+        # Remaining path length always falls when the robot is following its route,
+        # detour or not, so this only fires when the robot genuinely is not
+        # advancing along the plan it has.
+        remaining = self._path_remaining(path)
         if self._prog_goal != goal:
             self._prog_goal = goal            # new goal: start a fresh window
             self.prog_history.clear()
         if not self.prog_history or now - self.prog_history[-1][0] >= 1.0:
-            self.prog_history.append((now, dist_goal))
+            self.prog_history.append((now, remaining))
         if len(self.prog_history) >= 2:
             pt0, pd0 = self.prog_history[0]
-            if now - pt0 >= PROGRESS_WINDOW_S and (pd0 - dist_goal) < PROGRESS_MIN_M:
-                print(f"[{self.name}] NO PROGRESS: goal dist {pd0:.2f} -> "
-                      f"{dist_goal:.2f} m in {now - pt0:.0f}s; recovering")
+            if now - pt0 >= PROGRESS_WINDOW_S and (pd0 - remaining) < PROGRESS_MIN_M:
+                print(f"[{self.name}] NO PROGRESS: path left {pd0:.2f} -> "
+                      f"{remaining:.2f} m in {now - pt0:.0f}s; recovering")
                 self.prog_history.clear()
                 self._start_recovery(now)
                 return dist_goal
@@ -2841,6 +2854,46 @@ class GroundMission:
         self.path = chain + [(gx, gy)]
         self.last_replan = self.robot.getTime()
         return True
+
+    def _path_remaining(self, path):
+        """Distance still to drive along `path`, measured from the robot's closest
+        point ON the polyline rather than from the next waypoint.
+
+        Measuring to the next waypoint is not monotonic: once the robot drives past
+        a waypoint it can still be the nearest one, so the remaining distance jumps
+        back UP and a progress check reads that as going backwards. Projecting onto
+        the path instead falls smoothly the whole way along, including around a
+        detour, which is the only reason it can be compared against a threshold."""
+        if not path:
+            return float("inf")
+        if len(path) == 1:
+            return math.hypot(path[0][0] - self.x, path[0][1] - self.y)
+        seg = [math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+               for i in range(len(path) - 1)]
+        suffix = [0.0] * len(path)          # length from waypoint i onward to the goal
+        for i in range(len(path) - 2, -1, -1):
+            suffix[i] = suffix[i + 1] + seg[i]
+        best_d2, best_rem, best_head = None, None, False
+        for i in range(len(path) - 1):
+            ax, ay = path[i]
+            dx, dy = path[i + 1][0] - ax, path[i + 1][1] - ay
+            l2 = dx * dx + dy * dy
+            t = 0.0 if l2 <= 1e-12 else max(0.0, min(
+                1.0, ((self.x - ax) * dx + (self.y - ay) * dy) / l2))
+            px, py = ax + t * dx, ay + t * dy
+            d2 = (self.x - px) ** 2 + (self.y - py) ** 2
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best_rem = (1.0 - t) * seg[i] + suffix[i + 1]
+                best_head = (i == 0 and t <= 0.0)
+        if best_head:
+            # Still driving in to meet the route's first waypoint. Without counting
+            # that leg the measure sits flat for the whole approach, and a flat
+            # measure reads as no progress once the window is longer than the
+            # approach takes. Goes to zero as we reach the waypoint, so it stays
+            # continuous with the projected case.
+            best_rem += math.hypot(path[0][0] - self.x, path[0][1] - self.y)
+        return best_rem
 
     def _path_len(self, path):
         """Length of a path from where the robot is now, through every waypoint."""

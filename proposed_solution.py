@@ -274,14 +274,7 @@ DWA_W_VEL     = 0.12       # weight: prefer moving faster
 # It is O(n), provably free of the local-minimum trap that stalls potential-field
 # methods, and it only decides the HEADING -- DWA still produces (v, w) within the
 # acceleration limits, so all the existing safety behaviour is untouched.
-# Set FGM_ENABLE = False to A/B test against plain DWA.
-FGM_ENABLE       = True
-FGM_ALPHA        = 1.2                  # safety weight: higher hugs gap centres, lower cuts corners
-FGM_FOV          = math.radians(200.0)  # forward arc searched for gaps
-FGM_GAP_DIST     = 1.20                 # a beam this far or further counts as "free"
-FGM_WIDTH_MARGIN = 1.25                 # required gap width as a multiple of the robot diameter
-FGM_LOOKAHEAD    = 1.20                 # distance at which the FGM heading is projected to a target
-
+# Set
 DWA_V_ACCEL   = 0.6        # m/s^2
                            # Raised with the new top speed: at 0.6 the robot spent
                            # most of a short leg still accelerating and never
@@ -618,7 +611,6 @@ REVISIT_MAX         = 2      # max second-attempts per victim
 # victim it just failed on instead of pressing on, which wasted mission time. A
 # missed victim now stays missed and the robot moves on. (The separate "my OWN
 # current target is right here, confirm it early" shortcut is kept.)
-ENABLE_RETRY = False
 # Timing: do not time out while still closing in. Only once we are actually near
 # do we hold and report for CONFIRM_HOLD_S, and CONFIRM_MAX_S caps the whole
 # thing so a phantom estimate cannot trap us forever.
@@ -634,7 +626,6 @@ DEBUG_CAM = False
 # Live top-view map window (odometry trails, victim estimates + labels, both
 # robots, wall map, 1.0 m scoring circles). Great for seeing why a victim is not
 # being reached. Set False to disable.
-DEBUG_MAP = False
 
 # Exploration: once known victims are handled, the robots sweep the map for any
 # undetected victims. The two split the map so they do not re-cover the same
@@ -776,7 +767,6 @@ if PROFILE == "baseline":
     REPORT_ON_ODOM     = True
     REPORT_MAX_SENDS   = 24      # backstop only; see REPORT_MAX_SENDS above
     ORBIT_S             = 0.0    # no post-confirm orbit
-    FGM_ENABLE          = False  # plain DWA heading selection
     # Path hysteresis stays ON. Disabling it lets a flickering costmap cell flip
     # the route between two near-equal ways around an obstacle every replan, so the
     # robot loops instead of progressing. That is a planner defect, independent of
@@ -1170,7 +1160,6 @@ class GroundMission:
         self.last_debug = 0.0
         self.victim_dbg = {}         # per-victim closest sensor readings
         self._dbg_printed = False
-        self._last_map = -1.0        # throttle for the live top-view map window
 
         # Calibration filled after the first step.
         self.wheel_ref = None
@@ -1917,63 +1906,6 @@ class GroundMission:
             path.pop(0)
         return path[0]
 
-    def fgm_heading(self, goal_bearing):
-        """Follow the Gap Method (Sezer & Gokasan 2012) -- returns a steering
-        bearing, or None if no usable gap.
-
-        DWA alone is slow exactly where you saw it struggle: in clutter it scores
-        a fixed set of sampled arcs, and when every sampled arc clips something it
-        crawls or stalls hunting for a way through. FGM instead reads the gap
-        geometry straight off the scan in one pass: find the angular gaps, take the
-        widest one, aim at its CENTRE, then blend that with the goal direction:
-
-            phi_final = ( (alpha/d_min) * phi_gap_centre + phi_goal )
-                        / ( (alpha/d_min) + 1 )
-
-        As the nearest obstacle closes in (d_min -> 0) the gap centre dominates and
-        the robot commits to the opening; in the open, the goal direction dominates
-        so it does not wander. It is O(n) over the scan, has no local-minimum trap,
-        and here it only chooses the HEADING -- DWA still turns that into (v, w)
-        under the acceleration limits (the FGM-DW hybrid)."""
-        angs, rs = self.read_lidar()
-        if not angs:
-            return None
-        # Only consider what is roughly ahead; behind us is irrelevant to progress.
-        pts = sorted(((wrap_pi(a), d) for a, d in zip(angs, rs)
-                      if abs(wrap_pi(a)) <= FGM_FOV / 2.0), key=lambda p: p[0])
-        if not pts:
-            return None
-        d_min = max(min(d for _, d in pts), 1e-3)
-
-        # A gap is a run of consecutive beams whose range exceeds the threshold:
-        # far enough away that the robot could pass through there.
-        gaps, start = [], None
-        for i, (a, d) in enumerate(pts):
-            free = d >= FGM_GAP_DIST
-            if free and start is None:
-                start = i
-            elif not free and start is not None:
-                gaps.append((start, i - 1)); start = None
-        if start is not None:
-            gaps.append((start, len(pts) - 1))
-        if not gaps:
-            return None
-
-        # Widest gap by angular span, and it must be wide enough for the body.
-        best = max(gaps, key=lambda g: pts[g[1]][0] - pts[g[0]][0])
-        a0, a1 = pts[best[0]][0], pts[best[1]][0]
-        span = a1 - a0
-        if span * max(d_min, FGM_GAP_DIST) < 2.0 * ROBOT_RADIUS * FGM_WIDTH_MARGIN:
-            return None                      # opening too tight to fit through
-        phi_gap = 0.5 * (a0 + a1)            # gap centre angle
-
-        # If the goal already lies inside the widest gap, just go at the goal:
-        # no reason to aim off-centre when the direct line is already clear.
-        if a0 <= goal_bearing <= a1:
-            phi_gap = goal_bearing
-        w = FGM_ALPHA / d_min                # safety weight, grows as obstacles close in
-        return wrap_pi((w * phi_gap + goal_bearing) / (w + 1.0))
-
     def dwa(self, tx, ty):
         """Dynamic Window Approach. Rolls out candidate (v, w) commands as short
         arcs and returns the (v m/s, w rad/s) that best trades progress toward
@@ -2188,13 +2120,6 @@ class GroundMission:
         # still decides speed and turn rate, so acceleration limits, the collision
         # monitor and the victim carve-out all behave exactly as before -- this
         # only stops DWA hunting for a gap it can already be pointed at.
-        if FGM_ENABLE:
-            goal_b = wrap_pi(math.atan2(ty - self.y, tx - self.x) - self.theta)
-            fb = self.fgm_heading(goal_b)
-            if fb is not None and abs(wrap_pi(fb - goal_b)) > math.radians(5.0):
-                ang = self.theta + fb
-                tx = self.x + FGM_LOOKAHEAD * math.cos(ang)
-                ty = self.y + FGM_LOOKAHEAD * math.sin(ang)
         # Align in place before driving: if the waypoint is well off our heading,
         # rotate toward it instead of letting DWA open a wide arc (which is the
         # start-of-run circle on the mat). Rotating in place keeps the footprint
@@ -2326,93 +2251,6 @@ class GroundMission:
             "victim_confidence": float(confidence),
         }
         self.sup_emitter.send(json.dumps(msg).encode())
-
-    def draw_map(self):
-        """Live top-view map in a cv2 window: wall map, victim estimates with
-        labels and their 1.0 m scoring circles (green once found, red if not),
-        both robots' odometry trails, and each robot with a heading arrow. Each
-        robot draws the full picture because it also receives the other robot's
-        breadcrumbs. This is the clearest way to see why a victim is not reached."""
-        if not (DEBUG_MAP and _HAVE_CV2) or self.index != 0:
-            return   # robot1 draws the shared map (it has both trails + positions)
-        now = self.robot.getTime()
-        if now - self._last_map < 0.25:
-            return
-        self._last_map = now
-
-        xs = [self.x]
-        ys = [self.y]
-        for v in self.victims:
-            xs.append(v["x"]); ys.append(v["y"])
-        for wx1, wy1, wx2, wy2 in self.walls:
-            xs += [wx1, wx2]; ys += [wy1, wy2]
-        for p in self.trail + self.other_trail:
-            xs.append(p[0]); ys.append(p[1])
-        if self.other_pos is not None:
-            xs.append(self.other_pos[0]); ys.append(self.other_pos[1])
-        min_x, max_x = min(xs) - 1.0, max(xs) + 1.0
-        min_y, max_y = min(ys) - 1.0, max(ys) + 1.0
-
-        W = H = 760
-        pad = 30
-        scale = min((W - 2 * pad) / max(0.1, max_x - min_x),
-                    (H - 2 * pad) / max(0.1, max_y - min_y))
-
-        def to_px(x, y):
-            return (int(pad + (x - min_x) * scale),
-                    int(H - pad - (y - min_y) * scale))   # flip Y so up is +Y
-
-        img = np.full((H, W, 3), 32, np.uint8)
-
-        for wx1, wy1, wx2, wy2 in self.walls:                 # walls
-            cv2.line(img, to_px(wx1, wy1), to_px(wx2, wy2), (190, 190, 190), 2)
-
-        for p in self.other_trail:                            # trails (BGR)
-            cv2.circle(img, to_px(*p), 2, (150, 120, 0), -1)  # robot2 trail teal
-        for p in self.trail:
-            cv2.circle(img, to_px(*p), 2, (0, 140, 200), -1)  # robot1 trail orange
-
-        for v in self.victims:                                # victims + scoring ring
-            c = to_px(v["x"], v["y"])
-            # Honest colour: GREEN only when we actually closed in (done and not
-            # uncertain), YELLOW when we marked it done but never truly got within
-            # range (timed out far, likely blocked / bad estimate), RED untouched.
-            if not v["done"]:
-                col = (0, 0, 255)          # red: not handled
-            elif v.get("uncertain"):
-                col = (0, 210, 255)        # yellow: done but NOT confirmed close
-            else:
-                col = (0, 200, 0)          # green: confirmed close
-            cv2.circle(img, c, int(1.0 * scale), col, 1)      # 1.0 m scoring radius
-            # Inner grey ring = MARK_REACH_M, the odometry distance at which we
-            # actually mark the victim found. It is TIGHTER than the 1.0 m scoring
-            # ring on purpose, so "inside the big circle but still not green" is
-            # expected behaviour, not a bug.
-            cv2.circle(img, c, int(MARK_REACH_M * scale), (120, 120, 120), 1)
-            cv2.circle(img, c, 6, col, -1)
-            cv2.putText(img, f"V{v.get('id')}", (c[0] + 8, c[1] - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
-
-        if self.other_pos is not None:                        # other robot
-            oc = to_px(*self.other_pos)
-            cv2.circle(img, oc, 8, (255, 160, 0), 2)
-            cv2.putText(img, "other", (oc[0] + 9, oc[1] + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 160, 0), 1)
-
-        sc = to_px(self.x, self.y)                            # self + heading
-        tip = to_px(self.x + 0.5 * math.cos(self.theta),
-                    self.y + 0.5 * math.sin(self.theta))
-        cv2.arrowedLine(img, sc, tip, (0, 255, 255), 2, tipLength=0.4)
-        cv2.circle(img, sc, 8, (0, 255, 255), -1)
-        cv2.putText(img, self.name, (sc[0] + 9, sc[1] + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-        cv2.putText(img, f"green=found  yellow=done but far  red=not done   "
-                    f"outer ring=1.0m score / inner grey={MARK_REACH_M:.2f}m mark"
-                    f"   self=cyan  other=orange", (10, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (240, 240, 240), 1)
-        cv2.imshow(f"{self.name} map (top view)", img)
-        cv2.waitKey(1)
 
     def mark_reached_victims(self):
         """Mark ANY unfound victim as found the moment odometry says we are within
@@ -2577,8 +2415,6 @@ class GroundMission:
                 and self.state == "NAV":
             self._enter_confirm()   # our own goal is right here: skip the rest of the drive
             return
-        if not ENABLE_RETRY:
-            return   # do NOT break off to re-confirm some other victim; press on
         confirmed = hit["done"] and not (hit.get("skipped") or hit.get("uncertain"))
         if confirmed:
             return   # physically confirmed close before: nothing left to gain
@@ -3073,16 +2909,20 @@ class GroundMission:
             return True
         return False
 
-    def _skip_victim(self, v):
-        """Could not reach this victim (no path / walled off): mark it done so we
-        move on, but flag it skipped so a FREE robot can try it again later. A
-        cooldown stops the revisit logic from immediately re-picking it and
-        ping-ponging between two sealed goals every tick."""
-        v["done"] = True
-        v["skipped"] = True
-        # We never got near it, let alone saw it: it must NOT render as a confirmed
-        # (green) find. Without this the map painted unreachable victims green.
-        v["uncertain"] = True
+    def _defer_victim(self, v):
+        """Could not plan to this victim RIGHT NOW: stand it down for a cooldown and
+        get on with another one. It is never written off.
+
+        This used to mark the victim done, which meant one failed plan retired it for
+        the whole mission. In the logs robot2 did exactly that to two victims it was
+        a few metres from, then spent the remaining time in EXPLORE with no target.
+        That trade was never worth it: a victim we cannot route to this second is a
+        statement about the costmap a moment ago, not about the world, and the
+        costmap changes every time the robot moves. With the permeable second pass
+        in plan_to, a genuine no-path is close to impossible anyway.
+
+        The cooldown alone is enough to stop the planner ping-ponging between two
+        unreachable goals every tick, because _available already honours it."""
         self.no_path_until[v.get("id")] = self.robot.getTime() + NO_PATH_COOLDOWN_S
 
     def _new_victim_candidate(self, vx, vy):
@@ -3127,32 +2967,9 @@ class GroundMission:
             return False
         return True
 
-    def _pick_revisit(self):
-        """When we have no assigned victims left (free), pick one worth a second
-        attempt instead of just wandering: one we could not reach (skipped), or
-        one we 'confirmed' but with a large odometry gap (uncertain we truly got
-        within 1.0 m). Bounded by REVISIT_MAX so we never loop on a lost cause."""
-        now = self.robot.getTime()
-        cands = [v for v in self.victims
-                 if (v.get("skipped") or v.get("uncertain"))
-                 and v.get("free_retries", 0) < REVISIT_MAX
-                 and now >= self.no_path_until.get(v.get("id"), -1.0)
-                 and self._not_others(v)]
-        if not cands:
-            return None
-        v = min(cands, key=lambda v: math.hypot(v["x"] - self.x, v["y"] - self.y))
-        v["done"] = False
-        v["skipped"] = False
-        v["free_retries"] = v.get("free_retries", 0) + 1
-        print(f"[{self.name}] free; second attempt at victim #{v.get('id')} "
-              f"(try {v['free_retries']})")
-        return v
-
     def step_plan(self):
         self.on_safe_road = False
         self.target = self.pick_next_victim()
-        if self.target is None and ENABLE_RETRY:   # cleared our list: retry uncertain ones
-            self.target = self._pick_revisit()
         if self.target is None:
             self.state = "EXPLORE"
             return
@@ -3171,9 +2988,9 @@ class GroundMission:
                   f"{len(self.path)} waypoints")
             self.state = "NAV"
         else:
-            print(f"[{self.name}] no path to "
-                  f"({self.target['x']:.2f},{self.target['y']:.2f}); skipping")
-            self._skip_victim(self.target)
+            print(f"[{self.name}] no route to "
+                  f"({self.target['x']:.2f},{self.target['y']:.2f}) yet; retrying shortly")
+            self._defer_victim(self.target)
 
     def _enter_confirm(self):
         print(f"[{self.name}] arrived, confirming near "
@@ -3241,8 +3058,8 @@ class GroundMission:
                 if old_ok:
                     self.path = old_path      # keep driving what we had
                 else:
-                    print(f"[{self.name}] victim walled off by obstacles; skipping")
-                    self._skip_victim(self.target)
+                    print(f"[{self.name}] no route to victim just now; retrying shortly")
+                    self._defer_victim(self.target)
                     self.state = "PLAN"
                     return
             elif old_ok and not self.on_safe_road:
@@ -3264,7 +3081,7 @@ class GroundMission:
                 if old_ok:
                     self.path = old_path
                 else:
-                    self._skip_victim(self.target)
+                    self._defer_victim(self.target)
                     self.state = "PLAN"
             elif old_ok and not self.on_safe_road:
                 if self._path_len(self.path) > (1.0 - PATH_SWITCH_MARGIN) * old_len:
@@ -3517,7 +3334,6 @@ class GroundMission:
             self.mark_reached_victims()   # position-only marking, in ANY state
             self.maybe_report()     # report near ANY seen victim, in any state
             self.maybe_intercept()  # divert-and-close on an unconfirmed victim in view
-            self.draw_map()         # live top-view map window
 
             # Tipped over: hold still and skip the whole control step. Without this
             # the planner keeps issuing wheel commands while odometry is frozen, so

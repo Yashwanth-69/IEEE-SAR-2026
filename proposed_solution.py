@@ -300,6 +300,23 @@ OBS_THRESH      = 0.5         # score above this blocks planning (needs ~2 hits)
 OBS_DECAY       = 0.995       # very slow fade, only to bleed off odometry-drift smears
 OBS_MAX_RANGE   = 2.5         # mark hits closer than this; clear out to here, metres
 OBS_UPDATE_S    = 0.10        # min seconds between obstacle-layer updates
+# Blind-zone protection, the same idea as Nav2's raytrace_min_range.
+#
+# A low obstacle (below the lidar plane) is only ever seen by the depth camera, and
+# only beyond its ~0.6 m minimum range. Drive closer than that and NOTHING can see
+# it: the lidar sweeps over the top, the depth camera is inside its blind zone, and
+# the IR ring is too short. The lidar beams then ray-clear straight through the
+# cells where the obstacle actually is, the planner is told the ground is free, and
+# the robot drives onto it and tips.
+#
+# So no beam is allowed to CLEAR anything nearer than this. Marks made while the
+# obstacle was still visible survive the approach, which is the whole point: the
+# costmap has to remember what the sensors can no longer check.
+OBS_RAYTRACE_MIN_M = 0.75
+# Depth marks live in their own layer and decay on a timer rather than being
+# cleared by another sensor. Half-life is deliberately long (~14 s) so an obstacle
+# stays remembered for the whole approach, but a genuinely removed one is forgotten.
+DEPTH_DECAY     = 0.995
 REPLAN_PERIOD_S = 1.5         # replan on the fused map at least this often
 
 # Path hysteresis. A* is re-run periodically on a costmap that changes as the
@@ -1361,6 +1378,9 @@ class GroundMission:
                                   [(v["x"], v["y"]) for v in self.victims],
                                   self.start_xy)
         self.obs_score = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
+        # Depth-camera obstacles live apart from the lidar's, so a lidar beam
+        # sweeping over a low obstacle cannot clear the proof that it is there.
+        self.depth_score = np.zeros((self.grid.ny, self.grid.nx), dtype=np.float32)
         self.map_bounds = self._compute_map_bounds()
         self.explore_targets = self._my_explore_targets()
         self.explore_remaining = list(self.explore_targets)
@@ -1992,8 +2012,14 @@ class GroundMission:
         return best
 
     def _clear_local_obstacles(self):
-        """Nav2-style clear-costmap recovery: wipe sensed obstacles near the
-        robot so a fresh plan is not fighting stale or drifted marks."""
+        """Nav2-style clear-costmap recovery: wipe sensed obstacles near the robot so
+        a fresh plan is not fighting stale or drifted marks.
+
+        Deliberately clears the LIDAR layer only. The depth layer is what remembers
+        the low obstacle the robot is currently nose-to-nose with and can no longer
+        see, so wiping it here would delete the memory exactly when it is the only
+        thing keeping the robot off the obstacle - and recovery fires most often
+        when something is close. It fades on its own timer instead."""
         if self.obs_score is None:
             return
         g = self.grid
@@ -2642,47 +2668,47 @@ class GroundMission:
             return
         self.last_obs_update = now
         self.obs_score *= OBS_DECAY          # tiny fade, only for drift smears
-        angs, rs = self.read_lidar()
+        self.depth_score *= DEPTH_DECAY      # depth memory forgets on a timer
         g = self.grid
         tv = self._target_victim_xy()        # never mark the victim we approach
         r0, c0 = g.world_to_cell(self.x, self.y)
-        for a, d in zip(angs[::2], rs[::2]):  # downsample for speed
-            clear_d = min(d, OBS_MAX_RANGE)
-            ex = self.x + clear_d * math.cos(self.theta + a)
-            ey = self.y + clear_d * math.sin(self.theta + a)
-            r1, c1 = g.world_to_cell(ex, ey)
-            # Clear the free space the beam travelled through. This self-corrects
-            # marks that moved or were noise, and needs no exception for the flyover
-            # walls any more: they are a cost now, not part of this layer at all.
-            for (rr, cc) in self._ray_cells(r0, c0, r1, c1):
-                if g.in_bounds(rr, cc):
-                    self.obs_score[rr, cc] = max(0.0, self.obs_score[rr, cc] - OBS_MISS)
-            # Mark the hit cell itself (only real, close returns).
-            if d >= OBS_MAX_RANGE:
-                continue
-            wx = self.x + d * math.cos(self.theta + a)
-            wy = self.y + d * math.sin(self.theta + a)
-            if tv is not None and math.hypot(wx - tv[0], wy - tv[1]) < VICTIM_CLEAR_R:
-                continue   # this hit is the target's own body: it is the goal
-            r, c = g.world_to_cell(wx, wy)
-            if g.in_bounds(r, c):
-                self.obs_score[r, c] = min(OBS_MAX, self.obs_score[r, c] + OBS_HIT)
 
-        # Depth camera: mark obstacles at camera height the lidar plane misses
-        # (the rack rod). Mark only, no ray-clearing, so a lidar beam passing
-        # cleanly under/over the rod does not erase it; re-marking each cycle
-        # keeps it solid while visible, and the slow decay removes it once gone.
+        def _trace(angles, ranges, score, step=1):
+            """Mark hits and clear the free space each beam travelled through, into
+            ONE layer. A sensor may only ever clear its own layer: the lidar plane
+            passes clean over a low obstacle, so letting it clear the depth layer
+            would erase the only evidence that obstacle exists."""
+            for a, d in zip(angles[::step], ranges[::step]):
+                clear_d = min(d, OBS_MAX_RANGE)
+                ex = self.x + clear_d * math.cos(self.theta + a)
+                ey = self.y + clear_d * math.sin(self.theta + a)
+                cells = self._ray_cells(r0, c0, g.world_to_cell(ex, ey)[0],
+                                        g.world_to_cell(ex, ey)[1])
+                span = max(1, len(cells) - 1)
+                for i, (rr, cc) in enumerate(cells):
+                    # Never clear inside the blind zone: nothing can see there, so an
+                    # absence of returns is not evidence of free ground.
+                    if clear_d * i / span < OBS_RAYTRACE_MIN_M:
+                        continue
+                    if g.in_bounds(rr, cc):
+                        score[rr, cc] = max(0.0, score[rr, cc] - OBS_MISS)
+                if d >= OBS_MAX_RANGE:
+                    continue
+                wx = self.x + d * math.cos(self.theta + a)
+                wy = self.y + d * math.sin(self.theta + a)
+                if tv is not None and math.hypot(wx - tv[0], wy - tv[1]) < VICTIM_CLEAR_R:
+                    continue   # this hit is the target's own body: it is the goal
+                r, c = g.world_to_cell(wx, wy)
+                if g.in_bounds(r, c):
+                    score[r, c] = min(OBS_MAX, score[r, c] + OBS_HIT)
+
+        angs, rs = self.read_lidar()
+        _trace(angs, rs, self.obs_score, step=2)      # downsampled for speed
+        # The depth camera sees what the lidar plane misses: anything lower than the
+        # lidar, and anything that drops out of frame as the robot closes in. It gets
+        # its own layer so the lidar cannot clear it, and clears only itself.
         dangs, drs = self.read_depth_scan()
-        for a, d in zip(dangs, drs):
-            if d >= OBS_MAX_RANGE:
-                continue
-            wx = self.x + d * math.cos(self.theta + a)
-            wy = self.y + d * math.sin(self.theta + a)
-            if tv is not None and math.hypot(wx - tv[0], wy - tv[1]) < VICTIM_CLEAR_R:
-                continue
-            r, c = g.world_to_cell(wx, wy)
-            if g.in_bounds(r, c):
-                self.obs_score[r, c] = min(OBS_MAX, self.obs_score[r, c] + OBS_HIT)
+        _trace(dangs, drs, self.depth_score)
 
     def _dyn_mask(self):
         """Sensed-obstacle mask for planning, with every proven breadcrumb cell
@@ -2691,7 +2717,10 @@ class GroundMission:
         which is a common way the plan gets trapped near a big obstacle."""
         if self.obs_score is None:
             return None
-        mask = self.obs_score > OBS_THRESH
+        # Either sensor is enough to block a cell. They see different things: the
+        # lidar sees at its own height, the depth camera sees what is lower and what
+        # has dropped out of frame during the approach.
+        mask = (self.obs_score > OBS_THRESH) | (self.depth_score > OBS_THRESH)
         g = self.grid
         for (x, y) in self.trail + self.other_trail:
             r, c = g.world_to_cell(x, y)

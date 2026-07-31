@@ -2673,11 +2673,19 @@ class GroundMission:
         tv = self._target_victim_xy()        # never mark the victim we approach
         r0, c0 = g.world_to_cell(self.x, self.y)
 
-        def _trace(angles, ranges, score, step=1):
+        def _trace(angles, ranges, score, step=1, min_clear=0.0):
             """Mark hits and clear the free space each beam travelled through, into
             ONE layer. A sensor may only ever clear its own layer: the lidar plane
             passes clean over a low obstacle, so letting it clear the depth layer
-            would erase the only evidence that obstacle exists."""
+            would erase the only evidence that obstacle exists.
+
+            `min_clear` is that sensor's blind radius, inside which it may not clear.
+            It is PER SENSOR and must be, which I got wrong first time by applying
+            the depth camera's blind zone to the lidar as well. The lidar sees from
+            about 0.15 m, so forbidding it to clear nearby made every mark the robot
+            drove past permanent: it laid down a ring of obstacles around its own
+            route, boxed itself in, and sat in EXPLORE with no reachable target while
+            its scan read max range in every direction."""
             for a, d in zip(angles[::step], ranges[::step]):
                 clear_d = min(d, OBS_MAX_RANGE)
                 ex = self.x + clear_d * math.cos(self.theta + a)
@@ -2688,7 +2696,7 @@ class GroundMission:
                 for i, (rr, cc) in enumerate(cells):
                     # Never clear inside the blind zone: nothing can see there, so an
                     # absence of returns is not evidence of free ground.
-                    if clear_d * i / span < OBS_RAYTRACE_MIN_M:
+                    if clear_d * i / span < min_clear:
                         continue
                     if g.in_bounds(rr, cc):
                         score[rr, cc] = max(0.0, score[rr, cc] - OBS_MISS)
@@ -2702,13 +2710,16 @@ class GroundMission:
                 if g.in_bounds(r, c):
                     score[r, c] = min(OBS_MAX, score[r, c] + OBS_HIT)
 
+        # Lidar: sees from ~0.15 m, so it clears right up to the robot. It must, or
+        # marks it drives past can never be undone and it walls itself in.
         angs, rs = self.read_lidar()
-        _trace(angs, rs, self.obs_score, step=2)      # downsampled for speed
-        # The depth camera sees what the lidar plane misses: anything lower than the
-        # lidar, and anything that drops out of frame as the robot closes in. It gets
-        # its own layer so the lidar cannot clear it, and clears only itself.
+        _trace(angs, rs, self.obs_score, step=2, min_clear=0.0)
+        # Depth camera: sees what the lidar plane misses, both what is lower than the
+        # lidar and what drops out of frame as the robot closes in. Its own layer, so
+        # the lidar cannot clear it, and its own blind radius, inside which no absence
+        # of returns means anything.
         dangs, drs = self.read_depth_scan()
-        _trace(dangs, drs, self.depth_score)
+        _trace(dangs, drs, self.depth_score, min_clear=OBS_RAYTRACE_MIN_M)
 
     def _dyn_mask(self):
         """Sensed-obstacle mask for planning, with every proven breadcrumb cell
